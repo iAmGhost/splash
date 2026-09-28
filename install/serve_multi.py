@@ -1,0 +1,1649 @@
+#!/usr/bin/env python3
+"""Multi-model supervisor for Splash.
+
+Manages a pool of single-model ``server/server.py`` processes, forwarding
+requests to the engine serving the requested model and restarting the engine
+transparently when a request targets a different model.  In-flight requests
+are held (up to a short budget) during the switch; requests that arrive while
+a switch is already in flight and name yet another model are queued and held
+until their model is loaded (in arrival order).  Requests that cannot be
+served within the hold budget get a 503 with a ``Retry-After`` header so
+that standard OpenAI/Anthropic SDKs retry them without any application
+changes.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import functools
+import http.client
+import json
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+from collections import deque
+from http import server as http_server
+from pathlib import Path
+
+if __package__:
+    from . import assembly, paths
+    from . import models as model_artifacts
+else:
+    import assembly
+    import models as model_artifacts
+    import paths
+
+ROOT = paths.ROOT
+RUNTIME_DIR = paths.RUNTIME
+
+# Sentinel for detecting unpassed keyword arguments.
+_marker = object()
+
+
+def _ensure_installed(model: str) -> None:
+    """Install the model if it is not already present."""
+    selection = model_artifacts.Selection.of(paths.MODELS, model)
+    if model_artifacts.installation_kind(selection.link) is not None:
+        return
+    if not paths.PACKAGED:
+        with (RUNTIME_DIR / "build.lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            for command in (
+                ["make", "platform-check", "install-environment"],
+                ["make", "-j4", "all"],
+            ):
+                if subprocess.run(
+                    command, cwd=ROOT, pass_fds=(lock.fileno(),)
+                ).returncode:
+                    raise RuntimeError("source build failed; see the output above")
+    check = subprocess.run(
+        [str(paths.BINARY), "device-check"], capture_output=True, text=True
+    )
+    if check.returncode:
+        report = check.stderr.strip()
+        raise RuntimeError(
+            report.splitlines()[-1].removeprefix("error: ")
+            if check.returncode > 0 and report
+            else f"the engine's device check failed: {report or f'status {check.returncode}'}"
+        )
+    command = [
+        str(paths.PYTHON),
+        str(ROOT / "install/models.py"),
+        "--models",
+        str(selection.models_root),
+        "--model",
+        selection.model,
+        "prepare",
+    ]
+    for flag, value in (
+        ("--revision", selection.revision),
+        ("--draft-model", selection.draft_model),
+    ):
+        if value is not None:
+            command[-1:-1] = [flag, value]
+    if selection.language_only:
+        command.insert(-1, "--language-only")
+    if subprocess.run(command, cwd=ROOT).returncode:
+        raise RuntimeError("model download or verification failed")
+
+# ---------------------------------------------------------------------------
+# configuration / constants
+# ---------------------------------------------------------------------------
+HOLD_TIMEOUT = 600  # seconds a request waits while its model loads
+SETTLE_TIMEOUT = 60  # seconds to wait for the stopped engine's memory to be reclaimed
+
+# Eviction: a capped, best-effort pressure pass that nudges macOS to demote
+# stale file cache and reclaim wired (GPU) buffers so the next model can
+# allocate its Metal buffers without the "Q4 buffer below plan" failure.
+EVICT_CAP = 12 * 1024**3  # max bytes a single stale-cache reclaim pass may consume
+MEMORY_MARGIN = (2 * 1024**3, 0.08)  # (floor, fraction-of-weights) for need estimates
+
+
+# ---------------------------------------------------------------------------
+# vm-stat helpers (used by the supervisor to gauge memory)
+# ---------------------------------------------------------------------------
+
+_PAGE_SIZE = 16384  # standard on Apple Silicon
+
+
+def _vm_stat() -> dict[str, int] | None:
+    """Parse ``vm_stat`` into a page counter; None if it cannot be read."""
+    try:
+        result = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5)
+        if result.returncode != 0:
+            return None
+    except OSError:
+        return None
+    counters: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        if ":" not in line:
+            continue
+        key, _, rest = line.partition(":")
+        try:
+            counters[key.strip()] = int(rest.strip().rstrip(".").rstrip("pages"))
+        except ValueError:
+            continue
+    return counters
+
+
+def _vm_stat_available_bytes() -> int | None:
+    """Available memory (free + inactive + speculative + purgeable); None on failure."""
+    counters = _vm_stat()
+    if counters is None:
+        return None
+    return (
+        counters.get("Pages free", 0)
+        + counters.get("Pages inactive", 0)
+        + counters.get("Pages speculative", 0)
+        + counters.get("Pages purgeable", 0)
+    ) * _PAGE_SIZE
+
+
+def _vm_stat_wired_bytes() -> int | None:
+    """Wired (device) memory from ``vm_stat``; None on failure."""
+    counters = _vm_stat()
+    if counters is None:
+        return None
+    wired = counters.get("Pages wired down")
+    return wired * _PAGE_SIZE if wired is not None else None
+
+
+def _physical_memory_bytes() -> int | None:
+    try:
+        result = subprocess.run(
+            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode != 0:
+            return None
+        return int(result.stdout.strip())
+    except OSError:
+        return None
+
+
+def _process_tree_rss(pid: int) -> int | None:
+    """RSS (resident set size) in bytes for the process tree rooted at ``pid``."""
+    try:
+        tree: list[int] = [pid]
+        frontier: list[int] = [pid]
+        while frontier:
+            try:
+                out = subprocess.run(
+                    ["pgrep", "-P", str(frontier.pop())],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except OSError:
+                continue
+            if out.returncode == 0:
+                children = [int(p) for p in out.stdout.split() if p.strip()]
+                tree.extend(children)
+                frontier.extend(children)
+        out = subprocess.run(
+            ["ps", "-o", "rss=", "-p", ",".join(str(p) for p in tree)],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode != 0:
+            return None
+        return sum(int(line) for line in out.stdout.split() if line)
+    except (OSError, ValueError):
+        return None
+
+
+def _model_memory_need(model: str) -> int | None:
+    """Estimated minimum resident memory (bytes) for ``model``.
+
+    The engine pulls its (file-backed) weight pages into unified memory during
+    warmup and reserves the sparse KV plus activation working set on top, so
+    the model's weight file sizes dominate its requirement.  This estimate
+    lets the supervisor wait for *enough* memory before launching the next
+    model and warn clearly when the machine cannot supply it.  ``None`` when
+    the model is not installed or its weights cannot be measured.
+    """
+    try:
+        selection = model_artifacts.Selection.of(paths.MODELS, model)
+        root, _ = assembly.hold(selection.link, paths.MODELS)
+    except Exception:
+        return None
+    total = 0
+    found = False
+    for sub in ("target", "draft", "vision"):
+        directory = root / sub
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("*"):
+            try:
+                if path.is_file():  # follows the symlink to the blob
+                    total += path.stat().st_size
+                    found = True
+            except OSError:
+                continue
+    if not found:
+        return None
+    floor, fraction = MEMORY_MARGIN
+    return total + max(floor, int(total * fraction))
+
+
+def _evict_stale_cache(size: int) -> None:
+    """Nudge macOS to demote stale file cache by briefly allocating ``size``
+    bytes of anonymous memory and freeing them again.
+
+    A just-stopped engine's weight pages linger in *active* memory (they are
+    file-backed and not yet demoted), so *available* stays low even though
+    the model is gone.  Faulting in a large anonymous buffer creates the
+    pressure that makes the kernel demote that cache to reclaimable;
+    releasing the buffer returns the pages.  Best effort and capped by the
+    caller; a failure to allocate is harmless (the wait still bounds the
+    switch).
+    """
+    size = int(size)
+    if size <= 0:
+        return
+    try:
+        pressure = bytearray(size)  # zero-filled: touches every page
+    except MemoryError:
+        return
+    del pressure
+
+
+# ---------------------------------------------------------------------------
+# config loading
+# ---------------------------------------------------------------------------
+
+
+def load_config(path: str | Path) -> list[dict]:
+    """Load the multi-model JSON config from ``path``.
+
+    Expected shape::
+
+        {"models": [
+            {"model": "OWNER/REPO", "aliases": ["alias1", "alias2"],
+             "max_context": null},
+            ...
+        ]}
+
+    Every ``model`` entry should be a repo ID that ``model_artifacts`` can
+    resolve; aliases are optional and must be valid served-model-name values.
+
+    Per-model keys use the same names as the shared CLI flags (e.g.
+    ``max_context`` for ``--max-context``); a flag given on the command line
+    takes precedence over the per-model value.
+    """
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as error:
+        raise ValueError(f"cannot read config {path}: {error}") from None
+    try:
+        document = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"config {path} is not valid JSON: {error}") from None
+    if not isinstance(document, dict):
+        raise ValueError("config must be a JSON object with a 'models' list")
+    unknown = sorted(set(document) - {"models"})
+    if unknown:
+        raise ValueError(
+            f"unknown top-level keys in config: {unknown}; "
+            "expected only {{'models': [...]}}"
+        )
+    raw = document.get("models")
+    if not isinstance(raw, list):
+        raise ValueError("config 'models' must be an array")
+    out: list[dict] = []
+    for index, entry in enumerate(raw):
+        where = f"models[{index}]"
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"{where} must be an object like "
+                '{{"model": "OWNER/REPO", "aliases": [...], "max_context": ...}}'
+            )
+        unknown = sorted(set(entry) - {"model", "aliases", "max_context"})
+        if unknown:
+            raise ValueError(f"{where}: unknown keys {unknown}")
+        model = entry.get("model")
+        if not isinstance(model, str) or not model:
+            raise ValueError(f"{where}: 'model' must be a non-empty string")
+        try:
+            model_artifacts.parse_model_id(model)
+        except ValueError:
+            raise ValueError(f"{where}: invalid model repo id '{model}'") from None
+        aliases = entry.get("aliases")
+        if aliases is None:
+            aliases = ()
+        elif not isinstance(aliases, list):
+            raise ValueError(f"{where}: 'aliases' must be an array")
+        else:
+            cleaned: list[str] = []
+            for alias in aliases:
+                if not isinstance(alias, str) or not alias:
+                    raise ValueError(f"{where}: alias must be a non-empty string")
+                cleaned.append(alias)
+            aliases = tuple(cleaned)
+        max_context = entry.get("max_context")
+        if max_context is not None and not isinstance(max_context, int):
+            raise ValueError(f"{where}: 'max_context' must be an integer or null")
+        out.append({"model": model, "aliases": aliases, "max_context": max_context})
+    if not out:
+        raise ValueError("config 'models' must contain at least one model")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# supervisor
+# ---------------------------------------------------------------------------
+
+
+class Supervisor:
+    """Manages one ``server/server.py`` process per model in a pool.
+
+    Only one child process runs at a time; the ``ServerForwarder`` routes
+    incoming requests to it and triggers a restart whenever a request names
+    a different model than the one currently loaded.
+    """
+
+    def __init__(
+        self,
+        model_specs: list[dict],
+        shared: dict,
+        host: str,
+        port: int,
+    ) -> None:
+        self.model_specs = model_specs
+        self.shared = shared
+        self.host = host
+        self.port = port
+        raw_hold = shared.get("switch_timeout", HOLD_TIMEOUT)
+        self.hold_timeout = float(raw_hold) if raw_hold is not None else HOLD_TIMEOUT
+        raw_settle = shared.get("switch_settle", SETTLE_TIMEOUT)
+        self.settle_timeout = (
+            float(raw_settle) if raw_settle is not None else SETTLE_TIMEOUT
+        )
+        self._evict_cache = bool(shared.get("evict_cache", True))
+
+        self._lock = threading.RLock()
+        # Serializes whole stop/settle/launch lifecycles so the switch,
+        # reaper, and watcher threads can never launch engines in parallel.
+        self._op_lock = threading.RLock()
+        self._child: subprocess.Popen | None = None
+        self._child_port: int | None = None
+        self._child_ready = False
+        self._switching = False
+        self._switch_target: str | None = None
+        self._switch_done = threading.Event()
+        self._switch_done.set()  # set == "no switch in progress"
+        # Models requested while a switch is in flight, in arrival order;
+        # _drain_queue starts them one at a time as each switch finishes.
+        self._queued_targets: list[str] = []
+        self._crash_times: list[float] = []
+        self._crash_loop = False  # 3 crashes in 60s; auto-restart parked
+        self._last_failed_child: subprocess.Popen | None = None
+        self._last_stopped_footprint: int | None = None
+        self._last_wired_baseline: int | None = None  # wired just before the
+        # last deliberate stop
+        self._launch_available_baseline: int | None = None  # available just
+        # before the current
+        # model loaded
+        self._relaunching: str | None = None  # set while a (re)launch runs
+        self._stop = threading.Event()
+        self._proxy_server: http_server.BaseServer | None = None
+        self._active_model: str | None = None
+
+    # -- public interface ---------------------------------------------------
+
+    @property
+    def active_model(self) -> str | None:
+        with self._lock:
+            return self._active_model
+
+    @property
+    def child_port(self) -> int | None:
+        with self._lock:
+            return self._child_port
+
+    @property
+    def child_ready(self) -> bool:
+        with self._lock:
+            return self._child_ready
+
+    @property
+    def switching(self) -> bool:
+        with self._lock:
+            return self._switching
+
+    @property
+    def switch_target(self) -> str | None:
+        with self._lock:
+            return self._switch_target
+
+    @property
+    def queued_models(self) -> list[str]:
+        with self._lock:
+            return list(self._queued_targets)
+
+    def switch_to(self, model: str) -> None:
+        """Request a switch to *model*.  Non-blocking; the switch runs in
+        a background thread.  If a switch is already in flight, a model that
+        differs from the in-flight target is queued and started as soon as
+        the current switch finishes (``_drain_queue``), so requests holding
+        for it are served in arrival order instead of being dropped."""
+        canonical = self._resolve_model(model)
+        with self._lock:
+            if self._active_model == canonical:
+                return
+            if self._switching:
+                if (
+                    canonical != self._switch_target
+                    and canonical not in self._queued_targets
+                ):
+                    self._queued_targets.append(canonical)
+                    print(
+                        f"serve-multi · queued switch to {model} "
+                        f"(after {self._switch_target})",
+                        flush=True,
+                    )
+                return
+            self._switching = True
+            self._switch_target = canonical
+            self._switch_done.clear()
+        threading.Thread(
+            target=self._do_switch,
+            args=(model,),
+            daemon=True,
+            name="serve-multi-switch",
+        ).start()
+
+    def _drain_queue(self) -> None:
+        """Start the next queued switch, if any, after the current switch or
+        load attempt has finished.  Called at the end of every switch/load
+        attempt (success or failure) so requests held for a later model are
+        served in arrival order."""
+        with self._lock:
+            if self._stop.is_set() or self._switching:
+                return
+            model = None
+            while self._queued_targets:
+                candidate = self._queued_targets.pop(0)
+                if candidate != self._active_model:
+                    model = candidate  # skip entries that are now current
+                    break
+            if model is None:
+                return
+            self._switching = True
+            self._switch_target = model
+            self._switch_done.clear()
+        print(f"serve-multi · starting queued switch to {model}", flush=True)
+        threading.Thread(
+            target=self._do_switch,
+            args=(model,),
+            daemon=True,
+            name="serve-multi-switch",
+        ).start()
+
+    def _load_first_model(self) -> bool:
+        """Load the first (default) model if none is running.  Returns True if
+        loading was initiated, False if already running, already switching, or
+        shutting down."""
+        with self._lock:
+            if self._active_model is not None:
+                return True  # already running
+            if self._switching:
+                return False  # another load/switch in progress
+            first = self.model_specs[0]["model"]
+            self._switching = True
+            self._switch_target = first
+            self._switch_done.clear()
+        print(f"serve-multi · loading first model: {first}", flush=True)
+        threading.Thread(
+            target=self._do_load_first,
+            args=(first,),
+            daemon=True,
+            name="serve-multi-load-first",
+        ).start()
+        return True
+
+    def _do_load_first(self, model: str) -> None:
+        """Load the first model from the config.  Runs in a background thread."""
+        try:
+            with self._op_lock:
+                self._stop_child()
+                self._settle_memory(_model_memory_need(model))
+                self._launch_child(model, wait_ready=True)
+            if self._stop.is_set():
+                return
+            with self._lock:
+                self._switching = False
+                self._switch_target = None
+                self._switch_done.set()
+            self._drain_queue()
+            print(f"serve-multi · now serving {model}", flush=True)
+        except Exception as error:
+            with self._lock:
+                self._switching = False
+                self._switch_target = None
+                self._switch_done.set()
+            self._drain_queue()
+            print(
+                f"serve-multi · first-model load failed: {error}",
+                file=sys.stderr,
+                flush=True,
+            )
+            # Don't park the supervisor permanently; the reaper will retry.
+
+    def shutdown(self) -> None:
+        self._stop.set()
+        if self._proxy_server is not None:
+            try:
+                self._proxy_server.server_close()
+            except OSError:
+                pass
+            self._proxy_server = None
+        self._stop_child()
+
+    # -- child process ------------------------------------------------------
+
+    def _child_command(self, model: str, spec: dict, port: int) -> list[str]:
+        selection = model_artifacts.Selection.of(paths.MODELS, model)
+        root, _ = assembly.hold(selection.link, paths.MODELS)
+        # Precedence: shared CLI flag (when given) > per-model config value
+        # > engine default (auto).
+        max_context = self.shared.get("max_context")
+        if max_context is None:
+            max_context = spec["max_context"]
+        max_memory = self.shared.get("max_memory")
+        command = [
+            str(paths.PYTHON),
+            "-u",
+            str(ROOT / "server" / "server.py"),
+            str(root / "target"),
+            str(root / "draft"),
+            "--tokenizer",
+            str(root / "tokenizer"),
+            "--model",
+            model,
+            "--binary",
+            str(paths.BINARY),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--max-memory",
+            "auto" if max_memory is None else str(max_memory),
+            "--max-context",
+            "auto" if max_context is None else str(max_context),
+        ]
+        kv_format = self.shared.get("kv_format")
+        if kv_format is not None and kv_format != "int8":
+            command.extend(("--kv-format", kv_format))
+        for name in spec.get("aliases") or ():
+            command.append(f"--served-model-name={name}")
+        if self.shared.get("default_reasoning_effort") is not None:
+            command.extend(
+                ["--default-reasoning-effort", self.shared["default_reasoning_effort"]]
+            )
+        if self.shared.get("max_request_size") is not None:
+            command.extend(["--max-request-size", str(self.shared["max_request_size"])])
+        if self.shared.get("max_cache_disk") is not None:
+            command.extend(["--max-cache-disk", str(self.shared["max_cache_disk"])])
+        if self.shared.get("max_image_pixels") is not None:
+            command.extend(["--max-image-pixels", str(self.shared["max_image_pixels"])])
+        if self.shared.get("no_webui"):
+            command.append("--no-webui")
+        for host in self.shared.get("allowed_host") or ():
+            command.extend(["--allowed-host", host])
+        return command
+
+    def _child_environment(self) -> dict:
+        environment = dict(
+            os.environ, PYTHONUNBUFFERED="1", TRANSFORMERS_VERBOSITY="error"
+        )
+        if self.shared.get("api_key") is not None:
+            environment["SPLASH_API_KEY"] = self.shared["api_key"]
+        return environment
+
+    def _launch_child(self, model: str, *, wait_ready: bool = True) -> None:
+        spec = self.model_specs_by_model(model)
+        # Defense in depth: never start a second engine while one is alive.
+        self._stop_child()
+        environment = self._child_environment()
+        self._launch_available_baseline = _vm_stat_available_bytes()
+        last_error: Exception | None = None
+        for _attempt in range(3):
+            if self._stop.is_set():
+                return
+            port = _pick_free_port("127.0.0.1")
+            child = subprocess.Popen(
+                self._child_command(model, spec, port),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=environment,
+                cwd=str(ROOT),
+            )
+            threading.Thread(
+                target=self._relay_output, args=(child,), daemon=True
+            ).start()
+            with self._lock:
+                self._child = child
+                self._child_port = port
+            threading.Thread(
+                target=self._watch_child,
+                args=(child,),
+                daemon=True,
+                name="serve-multi-child-watch",
+            ).start()
+            ready = self._wait_ready(child, port) if wait_ready else False
+            if ready:
+                with self._lock:
+                    self._child_ready = True
+                    self._crash_loop = False
+                self._last_failed_child = None
+                self._active_model = model
+                print(f"serve-multi · serving {model}", flush=True)
+                return
+            try:
+                child.terminate()
+                try:
+                    child.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+            except OSError:
+                pass
+            with self._lock:
+                self._child = None
+                self._child_port = None
+                self._child_ready = False
+            last_error = RuntimeError(
+                f"{model} did not become ready on attempt {_attempt + 1}"
+            )
+            time.sleep(0.5)
+        if last_error is not None:
+            raise RuntimeError(
+                f"{model} failed to start after 3 attempts: {last_error}"
+            )
+
+    def _wait_ready(self, child: subprocess.Popen, port: int) -> bool:
+        for _i in range(240):  # poll every 0.5s (~120s startup budget)
+            if self._stop.is_set():
+                return False
+            if child.poll() is not None:
+                return False
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+                conn.request("GET", "/ready")
+                resp = conn.getresponse()
+                conn.close()
+                if resp.status == 200:
+                    return True
+                if resp.status != 503:
+                    return False
+            except OSError:
+                pass
+            time.sleep(0.5)
+        return False
+
+    def _stop_child(self) -> None:
+        with self._lock:
+            child = self._child
+            self._child = None
+            self._child_ready = False
+        if child is None or child.poll() is not None:
+            return
+        self._last_stopped_footprint = self._stopped_footprint(child)
+        self._last_wired_baseline = _vm_stat_wired_bytes()
+        child.terminate()
+        try:
+            child.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            try:
+                child.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def _stopped_footprint(self, child: subprocess.Popen) -> int | None:
+        """How much memory the stopped engine held, in bytes.
+
+        ``ps`` RSS undercounts a file-backed engine (its weights live in the
+        page cache, not in RSS), so the number that matters for the *next*
+        model is how far *available* memory fell since this one launched: that
+        is the cache the kernel must reclaim before the next model fits.  RSS
+        is kept as a floor for the case where the launch baseline was
+        unmeasured.
+        """
+        candidates: list[int] = []
+        if rss := _process_tree_rss(child.pid):
+            candidates.append(rss)
+        baseline = self._launch_available_baseline
+        if baseline is not None and (current := _vm_stat_available_bytes()) is not None:
+            candidates.append(max(0, baseline - current))
+        return max(candidates) if candidates else None
+
+    def _relay_output(self, child: subprocess.Popen) -> None:
+        assert child.stdout is not None
+        tail: deque[bytes] = deque()
+        tail_bytes = 0
+        # Shared with _output_tail so a crash report can quote the last lines.
+        child._splash_output_tail = tail
+        try:
+            for line in iter(child.stdout.readline, b""):
+                if self._stop.is_set():
+                    break
+                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.flush()
+                tail.append(line)
+                tail_bytes += len(line)
+                while tail_bytes > 32768 and len(tail) > 1:
+                    tail_bytes -= tail.popleft()
+        except (OSError, ValueError):
+            pass  # the pipe closed; the watcher is the authoritative signal
+
+    def _settle_memory(self, need: int | None = None) -> None:
+        """Wait (bounded) for the machine to make room for the next model.
+
+        A just-stopped engine leaves its memory behind in two pools the next
+        engine cannot use:
+
+        * *available* (free + inactive + speculative + purgeable): the
+          stopped engine's file-backed weight pages linger in *active*
+          memory and only become reclaimable as the kernel demotes them,
+          which on a busy machine is slow (10-60s, in plateaus) — leaving
+          too little for the next model's weight pages and sparse KV.
+        * *wired* (device memory, capped by ``iogpu.wired_limit_mb``
+          independently of ``available``): the killed engine's GPU buffers
+          stay wired until the iogpu collector reclaims them asynchronously,
+          and the next engine's Metal maps fail against the old engine's
+          still-counted wired memory ("Q4 buffer is below plan requirement"
+          with plenty of ``available``).
+
+        The available target is the greater of the next model's known
+        requirement (``need``) and "available at stop + 80% of the stopped
+        engine's footprint", capped at 60% of physical RAM so a loaded
+        machine still has a reachable goal.  When available is below that
+        and the machine has headroom, a brief allocate/free pressure pass
+        nudges the kernel to demote the stale cache now instead of waiting
+        it out.
+
+        A pool is done once it reaches its target, or is flat for ~15s
+        *and* available is already at the next model's requirement.  A pool
+        that cannot be measured is treated as cleared: the engine's own
+        planner is the final judge, and its output says why.  If the
+        budget runs out with available still below the next model's need,
+        we proceed anyway but warn clearly.
+        """
+        if self.settle_timeout <= 0 or self._stop.is_set():
+            return
+        physical = _physical_memory_bytes()
+        floor = int(physical * 0.6) if physical else None
+        available = _vm_stat_available_bytes()
+        footprint = self._last_stopped_footprint
+        estimate = (
+            available + int(footprint * 0.8)
+            if available is not None and footprint
+            else None
+        )
+        lower = [value for value in (need, estimate) if value]
+        target = max(lower) if lower else floor
+        if lower and floor is not None:
+            target = min(floor, target)  # the 60% cap bounds a loaded machine
+
+        # Nudge the kernel to demote the stale cache now rather than waiting
+        # the full budget for it to happen on its own.  Sized to the stopped
+        # engine's footprint (the cache to reclaim), capped by available so
+        # a loaded machine is never pushed toward OOM, and capped
+        # absolutely.
+        if (
+            self._evict_cache
+            and not self._stop.is_set()
+            and target is not None
+            and available is not None
+            and available < target
+        ):
+            size = int(
+                min(
+                    footprint or max(0, target - available),
+                    available * 0.4,
+                    EVICT_CAP,
+                )
+            )
+            if size > 0:
+                print(
+                    f"serve-multi · reclaiming the stopped engine's cache "
+                    f"({_gib(size)} GiB pressure pass)",
+                    flush=True,
+                )
+                _evict_stale_cache(size)
+                available = _vm_stat_available_bytes()
+
+        wired_ceiling = None
+        if self._last_wired_baseline is not None:
+            wired_ceiling = self._last_wired_baseline + 2 * 1024**3
+        wired = _vm_stat_wired_bytes() if wired_ceiling is not None else None
+        avail_ok = target is None or available is None or available >= target
+        wired_ok = wired_ceiling is None or wired is None or wired <= wired_ceiling
+        if available is None and (wired_ceiling is None or wired is None):
+            return  # cannot measure; let the engine's planner judge
+        if avail_ok and wired_ok:
+            return  # both pools already clear
+        shown_target = _gib(target) if target else "n/a"
+        shown_wired = (
+            f", {_gib(wired)} GiB wired, ceiling {_gib(wired_ceiling)} GiB"
+            if wired_ceiling is not None and wired is not None
+            else ""
+        )
+        print(
+            f"serve-multi · waiting for memory to settle "
+            f"({_gib(available) if available is not None else 'n/a'} GiB available, "
+            f"target {shown_target} GiB{shown_wired})",
+            flush=True,
+        )
+        deadline = time.monotonic() + self.settle_timeout
+        avail_samples: deque[int] = deque(maxlen=30)  # ~15s of 0.5s samples
+        wired_samples: deque[int] = deque(maxlen=30)
+        if available is not None:
+            avail_samples.append(available)
+        if wired is not None:
+            wired_samples.append(wired)
+        avail_done = avail_ok
+        wired_done = wired_ok
+        plateaued = False
+        while time.monotonic() < deadline and not self._stop.is_set():
+            time.sleep(0.5)
+            available = _vm_stat_available_bytes()
+            if wired_ceiling is not None:
+                wired = _vm_stat_wired_bytes()
+            if available is None and (wired_ceiling is None or wired is None):
+                return  # cannot measure; let the engine's planner judge
+            if available is None:
+                avail_done = True  # unmeasurable; the engine will judge
+            if not avail_done and available is not None:
+                avail_samples.append(available)
+                if target is not None and available >= target:
+                    avail_done = True  # fully settled
+                elif (
+                    len(avail_samples) == avail_samples.maxlen
+                    and max(avail_samples) - min(avail_samples) < 0.5 * 1024**3
+                    and (need is None or available >= need)
+                ):
+                    avail_done = True  # flat, but enough for the next model
+                    plateaued = True
+            if wired is None and wired_ceiling is not None:
+                wired_done = True  # unmeasurable; the engine will judge
+            if not wired_done and wired_ceiling is not None and wired is not None:
+                wired_samples.append(wired)
+                if wired <= wired_ceiling:
+                    wired_done = True  # the GPU arena is actually free
+                elif (
+                    len(wired_samples) == wired_samples.maxlen
+                    and max(wired_samples) - min(wired_samples) < 0.5 * 1024**3
+                ):
+                    wired_done = True  # the collector has stalled; proceed
+                    plateaued = True
+            if avail_done and wired_done:
+                if plateaued:
+                    print(
+                        "serve-multi · memory plateaued "
+                        f"({_gib(available) if available is not None else 'n/a'} "
+                        f"GiB available, "
+                        f"{_gib(wired) if wired is not None else 'n/a'} GiB wired); "
+                        "proceeding",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        "serve-multi · memory settled "
+                        f"({_gib(available) if available is not None else 'n/a'} "
+                        f"GiB available, "
+                        f"{_gib(wired) if wired is not None else 'n/a'} GiB wired); "
+                        "loading",
+                        flush=True,
+                    )
+                return
+        if need is not None and available is not None and available < need:
+            print(
+                f"serve-multi · WARNING: only "
+                f"{_gib(available)} GiB is available but the next model needs "
+                f"about {_gib(need)} GiB; it will likely fail to load. Close "
+                "other memory-heavy apps (another model server, ...) and retry.",
+                file=sys.stderr,
+                flush=True,
+            )
+        print(
+            f"serve-multi · memory did not settle within "
+            f"{self.settle_timeout:.0f}s "
+            f"({_gib(available) if available is not None else 'n/a'} GiB available, "
+            f"target {shown_target} GiB, "
+            f"{_gib(wired) if wired is not None else 'n/a'} GiB wired); "
+            "proceeding anyway",
+            flush=True,
+        )
+
+    def _watch_child(self, child: subprocess.Popen) -> None:
+        """Run until the child exits; restart on unexpected death."""
+        while True:
+            model = self.active_model
+            if model is None:
+                return
+            child.wait()
+            if self._stop.is_set():
+                return
+            with self._lock:
+                if self._child is not child:
+                    return  # already replaced
+            if child.poll() == 0:
+                return  # clean exit (shouldn't normally happen)
+            # Unexpected crash — restart after settling.  Serialized on
+            # _op_lock and re-checked under it: a switch may have taken over
+            # while we were waiting for the lock.
+            if tail := self._output_tail(child):
+                print(tail, flush=True)
+            try:
+                with self._op_lock:
+                    with self._lock:
+                        if self._child is not child or self._switching:
+                            return  # superseded or a switch owns the lifecycle
+                    self._settle_memory(_model_memory_need(model))
+                    self._launch_child(model, wait_ready=True)
+            except (RuntimeError, OSError) as error:
+                print(
+                    f"serve-multi · restart of {model} failed: {error}",
+                    flush=True,
+                )
+                # Park for a bit before retrying so we don't thrash the OS.
+                time.sleep(5)
+                continue
+
+    def _output_tail(self, child: subprocess.Popen) -> str | None:
+        tail = getattr(child, "_splash_output_tail", None)
+        if not tail:
+            return None
+        try:
+            return b"".join(tail).decode("utf-8", errors="replace")
+        except (OSError, ValueError):
+            return None
+
+    def _reap_loop(self) -> None:
+        """Periodically check whether the engine died and relaunch if so."""
+        while not self._stop.is_set():
+            time.sleep(2)
+            self._reap_once()
+
+    def _reap_once(self) -> None:
+        with self._lock:
+            child = self._child
+            model = self._active_model
+            switching = self._switching
+            if model is None or switching:
+                return  # a switch owns the lifecycle; it will (re)launch
+            if child is None or child.poll() is not None:
+                self._crash_times = [
+                    t for t in self._crash_times if time.monotonic() - t < 60
+                ]
+                self._crash_times.append(time.monotonic())
+                if len(self._crash_times) >= 3:
+                    self._crash_loop = True
+                if self._crash_loop:
+                    return
+                print(
+                    f"serve-multi · no engine serving; (re)launching {model}",
+                    flush=True,
+                )
+        try:
+            with self._op_lock:
+                # Re-check under the lifecycle lock: a switch may have
+                # started (and already relaunched) while we queued.
+                with self._lock:
+                    child = self._child
+                    if self._switching or (
+                        child is not None and child.poll() is None
+                    ):
+                        return
+                self._settle_memory(_model_memory_need(model))
+                self._launch_child(model, wait_ready=True)
+        except (RuntimeError, OSError) as error:
+            print(
+                f"serve-multi · (re)launch of {model} failed: {error}; will retry",
+                flush=True,
+            )
+
+    def _do_switch(self, model: str) -> None:
+        """Switch the active model to *model*.  Runs in a background thread."""
+        try:
+            canonical = self._resolve_model(model)
+            if canonical not in self._model_names():
+                raise ValueError(f"unknown model: {model}")
+            with self._op_lock:
+                self._stop_child()
+                self._settle_memory(_model_memory_need(canonical))
+                self._launch_child(canonical, wait_ready=True)
+            if self._stop.is_set():
+                return  # shutting down; do not commit an unready model
+            with self._lock:
+                self._switching = False
+                self._switch_target = None
+                self._switch_done.set()
+            self._drain_queue()
+            print(f"serve-multi · switched to {model}", flush=True)
+        except Exception as error:
+            # Try to restore the previous model before giving up (unless the
+            # request was rejected before the current engine was touched).
+            with self._lock:
+                self._switching = False
+                self._switch_target = None
+                self._switch_done.set()
+                previous = self._active_model
+            restore = (
+                not isinstance(error, ValueError) and previous and previous != model
+            )
+            if restore:
+                print(
+                    f"serve-multi · switch to {model} failed: {error}; "
+                    f"restoring {previous}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                try:
+                    with self._op_lock:
+                        self._settle_memory(_model_memory_need(previous))
+                        self._launch_child(previous, wait_ready=True)
+                except (RuntimeError, OSError) as restore_error:
+                    print(
+                        f"serve-multi · restore of {previous} also failed: "
+                        f"{restore_error}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            else:
+                print(
+                    f"serve-multi · switch to {model} failed: {error}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            self._drain_queue()
+
+    def _resolve_model(self, model: str) -> str:
+        """Resolve an alias or full model ID to the canonical model ID."""
+        for spec in self.model_specs:
+            if spec["model"] == model:
+                return model
+            if model in (spec.get("aliases") or ()):  # type: ignore[arg-type]
+                return spec["model"]
+        return model  # pass through; caller should reject if unknown
+
+    def model_specs_by_model(self, model: str | None = None) -> dict:
+        specs = {spec["model"]: spec for spec in self.model_specs}
+        if model is None:
+            return next(iter(specs.values())) if specs else {}
+        canonical = self._resolve_model(model)
+        return specs.get(canonical, {})
+
+    def _model_names(self) -> set[str]:
+        names = {spec["model"] for spec in self.model_specs}
+        for spec in self.model_specs:
+            names.update(spec.get("aliases") or ())  # type: ignore[arg-type]
+        return names
+
+
+# ---------------------------------------------------------------------------
+# HTTP proxy
+# ---------------------------------------------------------------------------
+
+
+# Hop-by-hop / connection-specific headers the proxy owns and never forwards.
+_HOP_BY_HOP_HEADERS = frozenset(
+    {
+        "host",
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+        "expect",
+        "te",
+        "trailers",
+        "upgrade",
+    }
+)
+# Response headers rewritten or dropped by the proxy when copying upstream.
+_SKIP_RESPONSE_HEADERS = _HOP_BY_HOP_HEADERS | {"content-encoding", "content-language"}
+
+
+class _ForwardingHTTPServer(http_server.ThreadingHTTPServer):
+    """HTTP server that accepts connections and proxies them to the active
+    ``server/server.py`` instance."""
+
+    def __init__(self, *args, supervisor: Supervisor | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.supervisor = supervisor
+
+
+class _ServeMultiHandler(http_server.BaseHTTPRequestHandler):
+    """Proxies requests to the active single-model server and triggers
+    model switches when the ``model`` field in chat/completions requests
+    names a different model."""
+
+    supervisor: Supervisor
+
+    def __init__(self, request, client_address, server, *, supervisor=_marker):
+        # Allow supervisor to be set as a class attribute (e.g. in tests)
+        # or passed as a keyword argument (e.g. via functools.partial).
+        if supervisor is _marker:
+            self.supervisor = getattr(type(self), "supervisor", None)
+        else:
+            self.supervisor = supervisor
+        super().__init__(request, client_address, server)
+
+    def log_message(self, format, *args):
+        # Suppress default access logs to keep stdout clean.
+        pass
+
+    # -- routing ------------------------------------------------------------
+
+    def do_GET(self):
+        if self.path == "/ready":
+            if self.supervisor.switching or not self.supervisor.child_ready:
+                self._json(503, {"status": "switching"})
+                return
+            self._forward("GET", self.path, None)
+        elif self.path == "/status":
+            if self.supervisor.switching or not self.supervisor.child_ready:
+                self._json(
+                    503,
+                    {
+                        "status": "switching",
+                        "active_model": self.supervisor.active_model,
+                        "switch_target": self.supervisor.switch_target,
+                        "queued_models": self.supervisor.queued_models,
+                    },
+                )
+                return
+            self._forward("GET", self.path, None)
+        elif self.path == "/metrics":
+            if not self.supervisor.child_ready:
+                self._send(503, "service unavailable\n", "text/plain")
+                return
+            self._forward("GET", self.path, None)
+        elif self.path == "/v1/models" or self.path.startswith("/v1/models/"):
+            self._handle_models()
+        else:
+            self._forward("GET", self.path, None)
+
+    def do_POST(self):
+        # Read the body so we can inspect the model field before deciding
+        # whether to switch.
+        content_length = int(self.headers.get("Content-Length", 0))
+        body: bytes | None = None
+        if content_length > 0:
+            body = self.rfile.read(content_length)
+
+        # Only chat/completions, completions, and responses carry a modifiable
+        # ``model`` field that we need to inspect.
+        if body and self.path in (
+            "/v1/chat/completions",
+            "/v1/completions",
+            "/v1/responses",
+            "/v1/messages",
+        ):
+            switch = self._maybe_switch(body)
+            if switch is not None:
+                return  # already sent a 503
+
+        # Forward (with the original body for POST; GET never has a body).
+        self._forward("POST", self.path, body)
+
+    def do_DELETE(self):
+        self._forward("DELETE", self.path, None)
+
+    def do_OPTIONS(self):
+        self._forward("OPTIONS", self.path, None)
+
+    # -- model inspection ---------------------------------------------------
+
+    def _maybe_switch(self, body: bytes) -> None | int:
+        """Inspect the request body for a ``model`` field.  If it differs
+        from the currently active model, trigger a switch and hold the
+        connection until the switch completes.
+        Returns the status code sent (503) or None if no switch was needed."""
+        try:
+            data = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            # Not JSON — forward as-is (e.g. binary uploads, malformed
+            # requests that the backend will reject).
+            return None
+        if not isinstance(data, dict):
+            return None
+        req_model = data.get("model")
+        if not isinstance(req_model, str) or not req_model:
+            return None
+        active = self.supervisor.active_model
+        if active and req_model == active:
+            return None  # already serving this model
+        # Also check aliases.
+        if active:
+            active_aliases = self._active_aliases()
+            if req_model in active_aliases:
+                return None
+        if req_model not in self.supervisor._model_names():
+            # Not a model this deployment serves; a switch would just fail
+            # after cycling the engine, so answer immediately.
+            self._send_error(
+                503,
+                f"unknown model: {req_model} (not in the serve-multi config)",
+                "model_not_found",
+                code="model_not_found",
+            )
+            return 503
+        # Model mismatch — start a switch, or queue behind the one already in
+        # flight, then hold the connection until this model is served.
+        self.supervisor.switch_to(req_model)
+        return self._hold_until_switched(body, req_model)
+
+    def _hold_until_switched(self, body: bytes, req_model: str) -> int:
+        """Hold the connection (silently) until *req_model* is the active
+        model, then forward the request.  Returns 503 if that does not
+        happen within the hold budget (including queued switches)."""
+        # Hold the connection silently until the switch completes.  Nothing
+        # may be written before the status line, so no keep-alive pings are
+        # sent here; a client that gives up early simply retries and finds
+        # the new model ready.  (Writing SSE pings before send_response()
+        # would put "body" bytes ahead of the HTTP status line and corrupt
+        # the response.)
+        switch_timeout = self.supervisor.hold_timeout
+        deadline = time.monotonic() + switch_timeout
+
+        while time.monotonic() < deadline:
+            if not self.supervisor.switching and self.supervisor.child_ready:
+                active = self.supervisor.active_model
+                if active and (
+                    req_model == active or req_model in self._active_aliases()
+                ):
+                    break  # this request's model is the one being served
+            time.sleep(0.1)
+
+        # If the model never became active in time, return 503.
+        active = self.supervisor.active_model
+        if (
+            self.supervisor.switching
+            or not self.supervisor.child_ready
+            or not active
+            or (req_model != active and req_model not in self._active_aliases())
+        ):
+            target = self.supervisor.switch_target
+            self._send_error(
+                503,
+                f"model {req_model} was not ready within "
+                f"{switch_timeout:.0f}s"
+                + (f" (switching to {target})" if target else ""),
+                "model_switching",
+                code="model_switching",
+                retry_after="2",
+            )
+            return 503
+
+        # Switch complete — forward the original request.
+        self._forward("POST", self.path, body)
+        return 200
+
+    def _active_aliases(self) -> frozenset[str]:
+        active = self.supervisor.active_model
+        if not active:
+            return frozenset()
+        spec = self.supervisor.model_specs_by_model(active)
+        return frozenset(spec.get("aliases") or ())
+
+    # -- /v1/models synthesis ----------------------------------------------
+
+    def _handle_models(self):
+        """Synthesize the /v1/models response from the current model's
+        specification when no engine is ready, otherwise forward."""
+        ready = self.supervisor.child_ready
+        if not ready:
+            self._json(
+                503,
+                {
+                    "object": "list",
+                    "data": [],
+                    "models": [],
+                },
+            )
+            return
+        self._forward("GET", self.path, None)
+
+    # -- forwarding ---------------------------------------------------------
+
+    def _forward_headers(self) -> dict:
+        """The client's headers, minus the hop-by-hop headers the proxy owns."""
+        return {
+            key: value
+            for key, value in self.headers.items()
+            if key.lower() not in _HOP_BY_HOP_HEADERS
+        }
+
+    def _is_streaming_response(self, resp_headers: dict[str, str]) -> bool:
+        """Check if the upstream response is a streaming (SSE) response."""
+        content_type = self._header_value(resp_headers, "content-type")
+        return "text/event-stream" in content_type.lower()
+
+    def _header_value(self, headers: dict[str, str], name: str) -> str:
+        """Case-insensitive header lookup."""
+        name_lower = name.lower()
+        for key, value in headers.items():
+            if key.lower() == name_lower:
+                return value
+        return ""
+
+    def _write_upstream_response(self, resp: http.client.HTTPResponse) -> None:
+        """Copy an upstream response to the client, streaming SSE bodies."""
+        resp_headers = dict(resp.getheaders())
+        self.send_response(resp.status)
+        for key, value in resp_headers.items():
+            if key.lower() in _SKIP_RESPONSE_HEADERS:
+                continue
+            self.send_header(key, value)
+        if self._is_streaming_response(resp_headers):
+            # Stream chunk-by-chunk so tokens arrive in real time.  read1()
+            # issues at most one upstream read per call; read() would block
+            # until 64 KiB or EOF and defeat streaming.  Keep conn open:
+            # resp reads from it directly.
+            self.end_headers()
+            self.wfile.flush()
+            try:
+                while True:
+                    chunk = resp.read1(65536)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    self.wfile.flush()
+            except (OSError, BrokenPipeError):
+                pass
+        else:
+            resp_body = resp.read()
+            self.send_header("Content-Length", str(len(resp_body)))
+            self.end_headers()
+            self.wfile.write(resp_body)
+            self.wfile.flush()
+
+    def _forward(self, method: str, path: str, body: bytes | None) -> None:
+        port = self.supervisor.child_port
+        if port is None:
+            self._send_error(503, "no engine running", "server_error")
+            return
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+            conn.request(method, path, body, self._forward_headers())
+            try:
+                self._write_upstream_response(conn.getresponse())
+            except (OSError, BrokenPipeError):
+                # Client disconnected during forwarding; nothing we can do.
+                pass
+            finally:
+                conn.close()
+        except (OSError, http.client.HTTPException) as error:
+            self._send_error(502, f"upstream error: {error}", "upstream_error")
+
+    # -- response helpers ---------------------------------------------------
+
+    def _send_error(
+        self,
+        status: int,
+        message: str,
+        error_type: str,
+        *,
+        code: str | None = None,
+        retry_after: str | None = None,
+    ) -> None:
+        """Send an OpenAI-style JSON error body."""
+        error: dict = {"message": message, "type": error_type}
+        if code is not None:
+            error["code"] = code
+        payload = json.dumps({"error": error}, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        if retry_after is not None:
+            self.send_header("Retry-After", retry_after)
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _json(self, status: int, body: object) -> None:
+        payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send(self, status: int, body: str, content_type: str) -> None:
+        payload = body.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+
+# ---------------------------------------------------------------------------
+# entry point
+# ---------------------------------------------------------------------------
+
+
+def serve_multi(args) -> int:
+    """Launch the multi-model supervisor.
+
+    Args:
+        args: Parsed arguments from ``argparse``.  Must include
+            ``config``, ``host``, ``port``, and any shared flags that the
+            single-model ``serve`` command accepts.
+
+    Returns:
+        0 on success, 1 on error.
+    """
+    models = load_config(args.config)
+    for spec in models:
+        _ensure_installed(spec["model"])
+    shared: dict = {
+        "switch_timeout": args.switch_timeout,
+        "switch_settle": args.switch_settle,
+        "evict_cache": getattr(args, "evict_cache", True),
+        "default_reasoning_effort": getattr(args, "default_reasoning_effort", None),
+        "kv_format": getattr(args, "kv_format", "int8"),
+        "max_memory": getattr(args, "max_memory", None),
+        "max_context": getattr(args, "max_context", None),
+        "max_request_size": getattr(args, "max_request_size", None),
+        "max_cache_disk": getattr(args, "max_cache_disk", 0),
+        "max_image_pixels": getattr(args, "max_image_pixels", None),
+        "allowed_host": getattr(args, "allowed_host", []),
+        "api_key": getattr(args, "api_key", None),
+        "no_webui": getattr(args, "no_webui", False),
+    }
+    # Filter out None values to match the single-model serve defaults.
+    shared = {k: v for k, v in shared.items() if v is not None}
+
+    supervisor = Supervisor(models, shared, args.host, args.port)
+
+    # Install signal handlers so Ctrl+C / SIGTERM stops the supervisor cleanly.
+    previous = {}
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, lambda signum, frame: supervisor.shutdown())
+
+    try:
+        # Start the proxy on the user-facing port.
+        server = _ForwardingHTTPServer(
+            (args.host, args.port),
+            functools.partial(_ServeMultiHandler, supervisor=supervisor),
+            supervisor=supervisor,
+        )
+        supervisor._proxy_server = server
+        threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+            name="serve-multi-proxy",
+        ).start()
+        threading.Thread(
+            target=supervisor._reap_loop,
+            daemon=True,
+            name="serve-multi-reaper",
+        ).start()
+        print(
+            f"serve-multi · proxy listening on "
+            f"http://{args.host}:{args.port}  (models: "
+            f"{', '.join(m['model'] for m in models)})",
+            flush=True,
+        )
+        # Block until a signal calls supervisor.shutdown().
+        while not supervisor._stop.is_set():
+            time.sleep(0.5)
+        return 0
+    except (RuntimeError, OSError) as error:
+        print(f"serve-multi: {error}", file=sys.stderr, flush=True)
+        return 1
+    finally:
+        supervisor.shutdown()
+        # Restore original signal handlers.
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def _pick_free_port(host: str) -> int:
+    """Return a free TCP port by binding and immediately closing a socket."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((host, 0))
+        return probe.getsockname()[1]
+
+
+def _gib(n: int | None) -> str:
+    if n is None:
+        return "n/a"
+    return f"{n / 1024**3:.1f}"
+
+
+def _main(argv=None):
+    parser = argparse.ArgumentParser(
+        prog="splash serve-multi",
+        description="Serve multiple models; restart the engine when a request "
+        "names another.",
+    )
+    parser.add_argument(
+        "--config",
+        required=True,
+        metavar="FILE",
+        help="JSON file listing the models to serve",
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="HTTP bind address (default: 127.0.0.1; 0.0.0.0 for all IPv4 interfaces)",
+    )
+    parser.add_argument(
+        "--port",
+        type=lambda s: int(s),
+        default=os.environ.get("SPLASH_PORT", "8000"),
+        help="HTTP port (default: SPLASH_PORT or 8000)",
+    )
+    parser.add_argument(
+        "--default-reasoning-effort",
+        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
+        default=None,
+        help="shared: chat/Responses effort when unspecified",
+    )
+    parser.add_argument(
+        "--kv-format",
+        choices=("int8", "bf16"),
+        default="int8",
+        help="shared: target KV cache storage (default: int8)",
+    )
+    parser.add_argument(
+        "--max-memory",
+        default=None,
+        help="shared: Metal budget ceiling, e.g. 28G (default: auto)",
+    )
+    parser.add_argument(
+        "--max-context",
+        type=lambda s: (
+            int(s.rstrip("kK").lstrip()) * (1024 if s.lower().endswith("k") else 1)
+        ),
+        default=None,
+        help="shared context limit, e.g. 100K (takes precedence over the "
+        "per-model 'max_context' config value)",
+    )
+    parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[],
+        metavar="HOST",
+        help="shared: additional HTTP Host name to accept (repeatable)",
+    )
+    parser.add_argument(
+        "--max-request-size",
+        default=None,
+        help="shared: maximum HTTP request body size, e.g. 128M",
+    )
+    parser.add_argument(
+        "--max-image-pixels",
+        type=int,
+        default=None,
+        help="shared: maximum resized pixels per image",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("SPLASH_API_KEY"),
+        help="shared: API key (default: SPLASH_API_KEY)",
+    )
+    parser.add_argument(
+        "--no-webui",
+        action="store_true",
+        help="shared: disable the chat page",
+    )
+    parser.add_argument(
+        "--switch-timeout",
+        type=float,
+        default=None,
+        help=(
+            "seconds a request waits while its model loads "
+            "(default 600; 0 = answer 503 immediately)"
+        ),
+    )
+    parser.add_argument(
+        "--switch-settle",
+        type=float,
+        default=None,
+        help=(
+            "after stopping the current engine, wait up to this many seconds "
+            "for its memory to be reclaimed before launching the next one; "
+            "the wait ends early once the target is reached or memory is "
+            "truly flat (default 60; 0 disables)"
+        ),
+    )
+    parser.add_argument(
+        "--evict-cache",
+        action="store_true",
+        default=True,
+        help="nudge macOS to reclaim the stopped engine's file cache before "
+        "launching the next model (default: on)",
+    )
+    parser.add_argument(
+        "--no-evict-cache",
+        dest="evict_cache",
+        action="store_false",
+        help="skip the stale-cache pressure pass; faster switches but higher "
+        "risk of 'Q4 buffer below plan' failures",
+    )
+    args = parser.parse_args(argv)
+    return serve_multi(args) or 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
