@@ -22,8 +22,8 @@ except ImportError:  # Executed directly by the source or packaged entry point.
     import catalog
     import clients
     import models as model_artifacts
-    import serve_multi as _serve_multi
     import paths
+    import serve_multi as _serve_multi
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
