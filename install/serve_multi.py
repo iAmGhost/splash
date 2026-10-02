@@ -73,6 +73,12 @@ _marker = object()
 # configuration / constants
 # ---------------------------------------------------------------------------
 HOLD_TIMEOUT = 600  # seconds a request waits while its model loads
+# Seconds to wait for an engine to answer /ready before killing and
+# relaunching it.  0 means no cap: wait until it is ready or exits, so a
+# first-time model download (many GB, possibly tens of minutes) is never
+# cut short and restarted mid-transfer.
+STARTUP_TIMEOUT = 0.0
+READY_POLL_SECONDS = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +232,10 @@ class Supervisor:
         self.port = port
         raw_hold = shared.get("switch_timeout", HOLD_TIMEOUT)
         self.hold_timeout = float(raw_hold) if raw_hold is not None else HOLD_TIMEOUT
+        raw_startup = shared.get("startup_timeout", STARTUP_TIMEOUT)
+        self.startup_timeout = (
+            float(raw_startup) if raw_startup is not None else STARTUP_TIMEOUT
+        )
         # Pre-proxy security: mirror server.py's own checks so requests are
         # rejected before they reach the engine (and before a request's model
         # field can trigger a switch).
@@ -704,7 +714,16 @@ class Supervisor:
             )
 
     def _wait_ready(self, child: subprocess.Popen, port: int) -> bool:
-        for _i in range(240):  # poll every 0.5s (~120s startup budget)
+        """Wait until the engine answers /ready, exits, or the startup
+        budget is spent.  The budget is uncapped by default (0), because a
+        first-time model download happens inside this window and can run
+        far longer than any fixed engine-startup allowance."""
+        deadline = (
+            time.monotonic() + self.startup_timeout
+            if self.startup_timeout > 0
+            else None
+        )
+        while True:
             if self._stop.is_set():
                 return False
             if child.poll() is not None:
@@ -720,8 +739,15 @@ class Supervisor:
                     return False
             except OSError:
                 pass
-            time.sleep(0.5)
-        return False
+            if deadline is not None and time.monotonic() >= deadline:
+                print(
+                    f"serve-multi · engine did not become ready within "
+                    f"{self.startup_timeout:.0f}s; restarting it",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return False
+            time.sleep(READY_POLL_SECONDS)
 
     def _stop_child(self) -> None:
         with self._lock:
@@ -1468,6 +1494,7 @@ def serve_multi(args) -> int:
         api_key = validate_api_key(api_key)
     shared: dict = {
         "switch_timeout": args.switch_timeout,
+        "startup_timeout": getattr(args, "startup_timeout", None),
         "api_key": api_key,
         "allowed_host": _flag_values(passthrough, "--allowed-host"),
         "passthrough": _engine_arguments(passthrough),

@@ -695,6 +695,17 @@ def parse_args(argv=None):
             "503 is returned after this budget is exhausted (default 600)"
         ),
     )
+    serve_multi_parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=0.0,
+        metavar="SECONDS",
+        help=(
+            "seconds to wait for an engine to become ready before killing "
+            "and restarting it; 0 waits until it is ready or exits, so a "
+            "first-time model download is never cut short (default 0)"
+        ),
+    )
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)

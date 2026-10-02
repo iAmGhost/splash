@@ -24,6 +24,16 @@ def _free_port():
         return s.getsockname()[1]
 
 
+class _FakeChild:
+    """The slice of subprocess.Popen that _wait_ready inspects."""
+
+    def __init__(self, alive: bool = True):
+        self._alive = alive
+
+    def poll(self):
+        return None if self._alive else 1
+
+
 def _post(port, path, body, headers=None):
     return _post_with_timeout(port, path, body, headers=headers, timeout=5)
 
@@ -220,6 +230,22 @@ class ArgumentParsingTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.switch_timeout, 30.0)
+
+    def test_serve_multi_default_startup_timeout_is_uncapped(self):
+        args = launcher.parse_args(["serve-multi", "--config", "/tmp/config.json"])
+        self.assertEqual(args.startup_timeout, 0.0)
+
+    def test_serve_multi_custom_startup_timeout(self):
+        args = launcher.parse_args(
+            [
+                "serve-multi",
+                "--config",
+                "/tmp/config.json",
+                "--startup-timeout",
+                "45",
+            ]
+        )
+        self.assertEqual(args.startup_timeout, 45.0)
 
     def test_main_dispatches_to_serve_multi(self):
         """When args.command == 'serve-multi', main calls serve_multi.serve_multi."""
@@ -1530,6 +1556,69 @@ class ProxySecurityTests(ProxyTests):
 
 
 class SupervisorTests(unittest.TestCase):
+    def _ready_backend(self, ready: bool):
+        """A fake engine whose /ready can be flipped by mutating the
+        returned handler class's ready_flag."""
+        port = _free_port()
+        handler_class = type(
+            "FakeBackend",
+            (FakeBackendHandler,),
+            {"model_id": "a", "ready_flag": ready},
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", port), handler_class)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return port, handler_class, server
+
+    def test_wait_ready_default_has_no_wall_clock_cap(self):
+        """With the default startup timeout, _wait_ready keeps polling until
+        the engine is ready, however long a first-time download takes."""
+        supervisor = serve_multi.Supervisor(
+            [{"model": "a"}], {"switch_timeout": 600.0}, "127.0.0.1", 0
+        )
+        self.assertEqual(supervisor.startup_timeout, 0.0)
+        port, handler_class, server = self._ready_backend(ready=False)
+        try:
+            result: dict = {}
+            thread = threading.Thread(
+                target=lambda: result.setdefault(
+                    "ready", supervisor._wait_ready(_FakeChild(), port)
+                ),
+                daemon=True,
+            )
+            thread.start()
+            time.sleep(0.3)
+            self.assertTrue(thread.is_alive(), "should still be waiting")
+            handler_class.ready_flag = True
+            thread.join(timeout=3)
+            self.assertEqual(result.get("ready"), True)
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_wait_ready_startup_timeout_restarts_a_stuck_engine(self):
+        supervisor = serve_multi.Supervisor(
+            [{"model": "a"}],
+            {"switch_timeout": 600.0, "startup_timeout": 0.2},
+            "127.0.0.1",
+            0,
+        )
+        port, _handler_class, server = self._ready_backend(ready=False)
+        try:
+            with mock.patch("sys.stderr", io.StringIO()) as err:
+                start = time.monotonic()
+                self.assertFalse(supervisor._wait_ready(_FakeChild(), port))
+                self.assertLess(time.monotonic() - start, 2.0)
+                self.assertIn("did not become ready", err.getvalue())
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_wait_ready_returns_false_when_child_exits(self):
+        supervisor = serve_multi.Supervisor(
+            [{"model": "a"}], {"switch_timeout": 600.0}, "127.0.0.1", 0
+        )
+        self.assertFalse(supervisor._wait_ready(_FakeChild(alive=False), _free_port()))
+
     def test_switch_to_clears_switching_on_completion(self):
         """After switch_to completes, switching is False and active_model
         is updated."""

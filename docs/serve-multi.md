@@ -107,6 +107,7 @@ full list):
 | --- | --- | --- |
 | `--config FILE` | required | JSON config listing the models. |
 | `--switch-timeout SECONDS` | `600` | How long a request waits while its model loads before a `503`. `0` answers `503` immediately. |
+| `--startup-timeout SECONDS` | `0` | How long to wait for an engine to become ready before killing and restarting it. `0` waits until it is ready or exits, so a first-time model download (which happens inside this window) is never cut short. |
 
 ### Serve flags after `--`
 
