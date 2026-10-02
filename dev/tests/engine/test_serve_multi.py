@@ -200,8 +200,6 @@ class ArgumentParsingTests(unittest.TestCase):
     def test_serve_multi_default_switch_timeouts(self):
         args = launcher.parse_args(["serve-multi", "--config", "/tmp/config.json"])
         self.assertEqual(args.switch_timeout, 600.0)
-        self.assertEqual(args.switch_settle, 60.0)
-        self.assertTrue(args.evict_cache)
 
     def test_serve_multi_custom_switch_timeouts(self):
         args = launcher.parse_args(
@@ -211,14 +209,9 @@ class ArgumentParsingTests(unittest.TestCase):
                 "/tmp/config.json",
                 "--switch-timeout",
                 "30",
-                "--switch-settle",
-                "10",
-                "--no-evict-cache",
             ]
         )
         self.assertEqual(args.switch_timeout, 30.0)
-        self.assertEqual(args.switch_settle, 10.0)
-        self.assertFalse(args.evict_cache)
 
     def test_serve_multi_shared_flags_duplicated(self):
         # Confirm shared flags match what 'serve' supports.
@@ -442,8 +435,6 @@ class ProxyTests(unittest.TestCase):
     def _make_supervisor(self, models, backend_port, **kwargs):
         shared = {
             "switch_timeout": 600.0,
-            "switch_settle": 60.0,
-            "evict_cache": kwargs.get("evict_cache", False),
             "kv_format": "int8",
             "max_request_size": None,
             "max_cache_disk": 0,
@@ -696,7 +687,6 @@ class ProxyTests(unittest.TestCase):
         # state machine stays authoritative.
         with (
             mock.patch.object(supervisor, "_stop_child"),
-            mock.patch.object(supervisor, "_settle_memory"),
             mock.patch.object(supervisor, "_launch_child"),
         ):
             threading.Thread(target=advance_switch, daemon=True).start()
@@ -763,7 +753,6 @@ class ProxyTests(unittest.TestCase):
 
         with (
             mock.patch.object(supervisor, "_stop_child", side_effect=fake_stop),
-            mock.patch.object(supervisor, "_settle_memory"),
             mock.patch.object(supervisor, "_launch_child", side_effect=fake_launch),
         ):
             proxy_port = _free_port()
@@ -860,7 +849,6 @@ class ProxyTests(unittest.TestCase):
         try:
             with (
                 mock.patch.object(supervisor, "_stop_child"),
-                mock.patch.object(supervisor, "_settle_memory"),
                 mock.patch.object(
                     supervisor, "_launch_child", side_effect=fake_launch
                 ),
@@ -932,7 +920,6 @@ class ProxyTests(unittest.TestCase):
 
         try:
             with (
-                mock.patch.object(supervisor, "_settle_memory"),
                 mock.patch.object(
                     supervisor, "_launch_child", side_effect=fake_launch
                 ),
@@ -979,7 +966,6 @@ class ProxyTests(unittest.TestCase):
 
         try:
             with (
-                mock.patch.object(supervisor, "_settle_memory"),
                 mock.patch.object(
                     supervisor, "_launch_child", side_effect=fake_launch
                 ),
@@ -1044,7 +1030,6 @@ class ProxyTests(unittest.TestCase):
         try:
             with (
                 mock.patch.object(supervisor, "_stop_child"),
-                mock.patch.object(supervisor, "_settle_memory"),
                 mock.patch.object(
                     supervisor, "_launch_child", side_effect=fake_launch
                 ),
@@ -1213,7 +1198,7 @@ class ProxyTests(unittest.TestCase):
         # Create supervisor with NO model running
         supervisor = serve_multi.Supervisor(
             [{"model": "owner/repo-a", "aliases": ["alias-a"]}],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1231,7 +1216,6 @@ class ProxyTests(unittest.TestCase):
 
         with (
             mock.patch.object(supervisor, "_launch_child", patched_launch),
-            mock.patch.object(supervisor, "_settle_memory"),
         ):
             try:
                 proxy_port = _free_port()
@@ -1262,7 +1246,7 @@ class ProxyTests(unittest.TestCase):
         backend_port, t, server, _ = self._start_backend("owner/repo-a")
         supervisor = serve_multi.Supervisor(
             [{"model": "owner/repo-a", "aliases": ["alias-a"]}],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1279,7 +1263,6 @@ class ProxyTests(unittest.TestCase):
 
         with (
             mock.patch.object(supervisor, "_launch_child", patched_launch),
-            mock.patch.object(supervisor, "_settle_memory"),
         ):
             try:
                 proxy_port = _free_port()
@@ -1606,29 +1589,6 @@ class ProxySecurityTests(ProxyTests):
 
 
 # ---------------------------------------------------------------------------
-# memory helpers
-# ---------------------------------------------------------------------------
-
-
-class MemoryHelperTests(unittest.TestCase):
-    def test_model_memory_need_returns_none_for_missing_model(self):
-        result = serve_multi._model_memory_need("nonexistent/repo")
-        self.assertIsNone(result)
-
-    def test_vm_stat_available_bytes_returns_int_or_none(self):
-        result = serve_multi._vm_stat_available_bytes()
-        self.assertIsInstance(result, (int, type(None)))
-
-    def test_vm_stat_wired_bytes_returns_int_or_none(self):
-        result = serve_multi._vm_stat_wired_bytes()
-        self.assertIsInstance(result, (int, type(None)))
-
-    def test_physical_memory_bytes_returns_int_or_none(self):
-        result = serve_multi._physical_memory_bytes()
-        self.assertIsInstance(result, (int, type(None)))
-
-
-# ---------------------------------------------------------------------------
 # supervisor lifecycle
 # ---------------------------------------------------------------------------
 
@@ -1639,7 +1599,7 @@ class SupervisorTests(unittest.TestCase):
         is updated."""
         supervisor = serve_multi.Supervisor(
             [{"model": "a"}, {"model": "b"}],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1651,32 +1611,31 @@ class SupervisorTests(unittest.TestCase):
                 setattr(supervisor, "_active_model", model),
             )
             with mock.patch.object(supervisor, "_stop_child"):
-                with mock.patch.object(supervisor, "_settle_memory"):
-                    # Set up initial state.
-                    supervisor._active_model = "a"
-                    supervisor._child_ready = True
-                    self.assertFalse(supervisor.switching)
-                    self.assertIsNone(supervisor.switch_target)
-                    # Trigger switch.
-                    supervisor.switch_to("b")
-                    # Wait for background thread to complete.
-                    for _ in range(40):
-                        time.sleep(0.05)
-                        if not supervisor.switching:
-                            break
-                    # Verify the switch completed.
-                    self.assertFalse(supervisor.switching, "switching should be False")
-                    self.assertIsNone(
-                        supervisor.switch_target, "switch_target should be None"
-                    )
-                    self.assertEqual(supervisor.active_model, "b")
-                    # _launch_child should have been called for "b".
-                    launch.assert_any_call("b", wait_ready=True)
+                # Set up initial state.
+                supervisor._active_model = "a"
+                supervisor._child_ready = True
+                self.assertFalse(supervisor.switching)
+                self.assertIsNone(supervisor.switch_target)
+                # Trigger switch.
+                supervisor.switch_to("b")
+                # Wait for background thread to complete.
+                for _ in range(40):
+                    time.sleep(0.05)
+                    if not supervisor.switching:
+                        break
+                # Verify the switch completed.
+                self.assertFalse(supervisor.switching, "switching should be False")
+                self.assertIsNone(
+                    supervisor.switch_target, "switch_target should be None"
+                )
+                self.assertEqual(supervisor.active_model, "b")
+                # _launch_child should have been called for "b".
+                launch.assert_any_call("b", wait_ready=True)
 
     def test_switch_to_is_idempotent_for_same_model(self):
         supervisor = serve_multi.Supervisor(
             [{"model": "a"}, {"model": "b"}],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1685,17 +1644,16 @@ class SupervisorTests(unittest.TestCase):
         with mock.patch.object(supervisor, "_launch_child") as launch:
             launch.side_effect = lambda model, **kw: launched.append(model)
             with mock.patch.object(supervisor, "_stop_child"):
-                with mock.patch.object(supervisor, "_settle_memory"):
-                    supervisor.switch_to("a")
-                    time.sleep(0.05)
-                    self.assertEqual(launched, [])  # no launch for same model
+                supervisor.switch_to("a")
+                time.sleep(0.05)
+                self.assertEqual(launched, [])  # no launch for same model
 
     def test_switch_to_queues_model_while_switch_in_flight(self):
         """A model requested while a switch is in flight is queued (deduped)
         and started automatically once the current switch completes."""
         supervisor = serve_multi.Supervisor(
             [{"model": "a"}, {"model": "b"}, {"model": "c"}],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1714,7 +1672,6 @@ class SupervisorTests(unittest.TestCase):
         with (
             mock.patch.object(supervisor, "_launch_child", side_effect=slow_launch),
             mock.patch.object(supervisor, "_stop_child"),
-            mock.patch.object(supervisor, "_settle_memory"),
         ):
             supervisor.switch_to("b")
             for _ in range(200):
@@ -1742,7 +1699,7 @@ class SupervisorTests(unittest.TestCase):
         queued model instead of retrying the failing one."""
         supervisor = serve_multi.Supervisor(
             [{"model": "a"}, {"model": "b"}, {"model": "c"}],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1760,7 +1717,6 @@ class SupervisorTests(unittest.TestCase):
 
         with (
             mock.patch.object(supervisor, "_stop_child"),
-            mock.patch.object(supervisor, "_settle_memory"),
             mock.patch.object(supervisor, "_launch_child", side_effect=fake_launch),
         ):
             supervisor._queued_targets = ["b", "c"]
@@ -1780,7 +1736,7 @@ class SupervisorTests(unittest.TestCase):
     def test_shutdown_stops_child(self):
         supervisor = serve_multi.Supervisor(
             [{"model": "a"}],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1793,7 +1749,7 @@ class SupervisorTests(unittest.TestCase):
     def test_active_model_property(self):
         supervisor = serve_multi.Supervisor(
             [{"model": "a"}],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1804,7 +1760,7 @@ class SupervisorTests(unittest.TestCase):
     def test_child_port_property(self):
         supervisor = serve_multi.Supervisor(
             [{"model": "a"}],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1815,7 +1771,7 @@ class SupervisorTests(unittest.TestCase):
     def test_resolve_model_by_full_id(self):
         supervisor = serve_multi.Supervisor(
             [{"model": "owner/repo", "aliases": ["alias"]}],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1824,7 +1780,7 @@ class SupervisorTests(unittest.TestCase):
     def test_resolve_model_by_alias(self):
         supervisor = serve_multi.Supervisor(
             [{"model": "owner/repo", "aliases": ["alias"]}],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1836,7 +1792,7 @@ class SupervisorTests(unittest.TestCase):
                 {"model": "owner/repo-a", "aliases": ["alias-a"]},
                 {"model": "owner/repo-b", "aliases": ["alias-b"]},
             ],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1849,7 +1805,7 @@ class SupervisorTests(unittest.TestCase):
     def test_model_specs_by_model_resolves_alias(self):
         supervisor = serve_multi.Supervisor(
             [{"model": "owner/repo", "aliases": ["alias"], "max_context": 8192}],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1891,7 +1847,7 @@ class SupervisorTests(unittest.TestCase):
                 {"model": "owner/repo-a", "aliases": ["alias-a"]},
                 {"model": "owner/repo-b", "aliases": ["alias-b"]},
             ],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1902,16 +1858,15 @@ class SupervisorTests(unittest.TestCase):
                 setattr(supervisor, "_active_model", model),
             )
             with mock.patch.object(supervisor, "_stop_child"):
-                with mock.patch.object(supervisor, "_settle_memory"):
-                    supervisor._active_model = "owner/repo-a"
-                    supervisor.switch_to("alias-b")
-                    for _ in range(40):
-                        time.sleep(0.05)
-                        if not supervisor.switching:
-                            break
-                    self.assertFalse(supervisor.switching)
-                    self.assertEqual(supervisor.active_model, "owner/repo-b")
-                    launch.assert_called_with("owner/repo-b", wait_ready=True)
+                supervisor._active_model = "owner/repo-a"
+                supervisor.switch_to("alias-b")
+                for _ in range(40):
+                    time.sleep(0.05)
+                    if not supervisor.switching:
+                        break
+                self.assertFalse(supervisor.switching)
+                self.assertEqual(supervisor.active_model, "owner/repo-b")
+                launch.assert_called_with("owner/repo-b", wait_ready=True)
 
     def test_load_first_model_lazy(self):
         """_load_first_model should launch the first model when none is running."""
@@ -1920,7 +1875,7 @@ class SupervisorTests(unittest.TestCase):
                 {"model": "owner/repo-a", "aliases": ["alias-a"]},
                 {"model": "owner/repo-b", "aliases": ["alias-b"]},
             ],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1931,25 +1886,24 @@ class SupervisorTests(unittest.TestCase):
                 setattr(supervisor, "_active_model", model),
             )
             with mock.patch.object(supervisor, "_stop_child"):
-                with mock.patch.object(supervisor, "_settle_memory"):
-                    # No model is currently running
-                    self.assertIsNone(supervisor.active_model)
-                    result = supervisor._load_first_model()
-                    self.assertTrue(result)
-                    # Should have initiated loading
-                    for _ in range(40):
-                        time.sleep(0.05)
-                        if not supervisor.switching:
-                            break
-                    self.assertFalse(supervisor.switching)
-                    self.assertEqual(supervisor.active_model, "owner/repo-a")
-                    launch.assert_called_with("owner/repo-a", wait_ready=True)
+                # No model is currently running
+                self.assertIsNone(supervisor.active_model)
+                result = supervisor._load_first_model()
+                self.assertTrue(result)
+                # Should have initiated loading
+                for _ in range(40):
+                    time.sleep(0.05)
+                    if not supervisor.switching:
+                        break
+                self.assertFalse(supervisor.switching)
+                self.assertEqual(supervisor.active_model, "owner/repo-a")
+                launch.assert_called_with("owner/repo-a", wait_ready=True)
 
     def test_load_first_model_no_op_when_running(self):
         """_load_first_model should return True without loading if a model is already running."""
         supervisor = serve_multi.Supervisor(
             [{"model": "owner/repo-a"}],
-            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            {"switch_timeout": 600.0},
             "127.0.0.1",
             0,
         )
@@ -1995,8 +1949,6 @@ class ServeMultiEntryTests(unittest.TestCase):
                     host="127.0.0.1",
                     port=0,
                     switch_timeout=600.0,
-                    switch_settle=60.0,
-                    evict_cache=True,
                     default_reasoning_effort=None,
                     kv_format="int8",
                     max_memory=None,

@@ -695,30 +695,6 @@ def parse_args(argv=None):
             "503 is returned after this budget is exhausted (default 600)"
         ),
     )
-    serve_multi_parser.add_argument(
-        "--switch-settle",
-        type=float,
-        default=60.0,
-        metavar="SECONDS",
-        help=(
-            "after stopping the current engine, wait up to this many seconds "
-            "for its memory to be reclaimed before launching the next one; "
-            "the wait ends early once the target is reached or memory is "
-            "truly flat (default 60)"
-        ),
-    )
-    serve_multi_parser.add_argument(
-        "--evict-cache",
-        action="store_true",
-        default=True,
-        help="nudge macOS to reclaim the stopped engine's file cache before launching the next model (default: on)",
-    )
-    serve_multi_parser.add_argument(
-        "--no-evict-cache",
-        dest="evict_cache",
-        action="store_false",
-        help="skip the stale-cache pressure pass; faster switches but higher risk of 'Q4 buffer below plan' failures",
-    )
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)

@@ -123,162 +123,6 @@ def _ensure_installed(model: str) -> None:
 # configuration / constants
 # ---------------------------------------------------------------------------
 HOLD_TIMEOUT = 600  # seconds a request waits while its model loads
-SETTLE_TIMEOUT = 60  # seconds to wait for the stopped engine's memory to be reclaimed
-
-# Eviction: a capped, best-effort pressure pass that nudges macOS to demote
-# stale file cache and reclaim wired (GPU) buffers so the next model can
-# allocate its Metal buffers without the "Q4 buffer below plan" failure.
-EVICT_CAP = 12 * 1024**3  # max bytes a single stale-cache reclaim pass may consume
-MEMORY_MARGIN = (2 * 1024**3, 0.08)  # (floor, fraction-of-weights) for need estimates
-
-
-# ---------------------------------------------------------------------------
-# vm-stat helpers (used by the supervisor to gauge memory)
-# ---------------------------------------------------------------------------
-
-_PAGE_SIZE = 16384  # standard on Apple Silicon
-
-
-def _vm_stat() -> dict[str, int] | None:
-    """Parse ``vm_stat`` into a page counter; None if it cannot be read."""
-    try:
-        result = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5)
-        if result.returncode != 0:
-            return None
-    except OSError:
-        return None
-    counters: dict[str, int] = {}
-    for line in result.stdout.splitlines():
-        if ":" not in line:
-            continue
-        key, _, rest = line.partition(":")
-        try:
-            counters[key.strip()] = int(rest.strip().rstrip(".").rstrip("pages"))
-        except ValueError:
-            continue
-    return counters
-
-
-def _vm_stat_available_bytes() -> int | None:
-    """Available memory (free + inactive + speculative + purgeable); None on failure."""
-    counters = _vm_stat()
-    if counters is None:
-        return None
-    return (
-        counters.get("Pages free", 0)
-        + counters.get("Pages inactive", 0)
-        + counters.get("Pages speculative", 0)
-        + counters.get("Pages purgeable", 0)
-    ) * _PAGE_SIZE
-
-
-def _vm_stat_wired_bytes() -> int | None:
-    """Wired (device) memory from ``vm_stat``; None on failure."""
-    counters = _vm_stat()
-    if counters is None:
-        return None
-    wired = counters.get("Pages wired down")
-    return wired * _PAGE_SIZE if wired is not None else None
-
-
-def _physical_memory_bytes() -> int | None:
-    try:
-        result = subprocess.run(
-            ["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=5
-        )
-        if result.returncode != 0:
-            return None
-        return int(result.stdout.strip())
-    except OSError:
-        return None
-
-
-def _process_tree_rss(pid: int) -> int | None:
-    """RSS (resident set size) in bytes for the process tree rooted at ``pid``."""
-    try:
-        tree: list[int] = [pid]
-        frontier: list[int] = [pid]
-        while frontier:
-            try:
-                out = subprocess.run(
-                    ["pgrep", "-P", str(frontier.pop())],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-            except OSError:
-                continue
-            if out.returncode == 0:
-                children = [int(p) for p in out.stdout.split() if p.strip()]
-                tree.extend(children)
-                frontier.extend(children)
-        out = subprocess.run(
-            ["ps", "-o", "rss=", "-p", ",".join(str(p) for p in tree)],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        )
-        if out.returncode != 0:
-            return None
-        return sum(int(line) for line in out.stdout.split() if line)
-    except (OSError, ValueError):
-        return None
-
-
-def _model_memory_need(model: str) -> int | None:
-    """Estimated minimum resident memory (bytes) for ``model``.
-
-    The engine pulls its (file-backed) weight pages into unified memory during
-    warmup and reserves the sparse KV plus activation working set on top, so
-    the model's weight file sizes dominate its requirement.  This estimate
-    lets the supervisor wait for *enough* memory before launching the next
-    model and warn clearly when the machine cannot supply it.  ``None`` when
-    the model is not installed or its weights cannot be measured.
-    """
-    try:
-        selection = model_artifacts.Selection.of(paths.MODELS, model)
-        root, _ = assembly.hold(selection.link, paths.MODELS)
-    except Exception:
-        return None
-    total = 0
-    found = False
-    for sub in ("target", "draft", "vision"):
-        directory = root / sub
-        if not directory.is_dir():
-            continue
-        for path in directory.rglob("*"):
-            try:
-                if path.is_file():  # follows the symlink to the blob
-                    total += path.stat().st_size
-                    found = True
-            except OSError:
-                continue
-    if not found:
-        return None
-    floor, fraction = MEMORY_MARGIN
-    return total + max(floor, int(total * fraction))
-
-
-def _evict_stale_cache(size: int) -> None:
-    """Nudge macOS to demote stale file cache by briefly allocating ``size``
-    bytes of anonymous memory and freeing them again.
-
-    A just-stopped engine's weight pages linger in *active* memory (they are
-    file-backed and not yet demoted), so *available* stays low even though
-    the model is gone.  Faulting in a large anonymous buffer creates the
-    pressure that makes the kernel demote that cache to reclaimable;
-    releasing the buffer returns the pages.  Best effort and capped by the
-    caller; a failure to allocate is harmless (the wait still bounds the
-    switch).
-    """
-    size = int(size)
-    if size <= 0:
-        return
-    try:
-        pressure = bytearray(size)  # zero-filled: touches every page
-    except MemoryError:
-        return
-    del pressure
 
 
 # ---------------------------------------------------------------------------
@@ -432,11 +276,6 @@ class Supervisor:
         self.port = port
         raw_hold = shared.get("switch_timeout", HOLD_TIMEOUT)
         self.hold_timeout = float(raw_hold) if raw_hold is not None else HOLD_TIMEOUT
-        raw_settle = shared.get("switch_settle", SETTLE_TIMEOUT)
-        self.settle_timeout = (
-            float(raw_settle) if raw_settle is not None else SETTLE_TIMEOUT
-        )
-        self._evict_cache = bool(shared.get("evict_cache", True))
         # Pre-proxy security: mirror server.py's own checks so requests are
         # rejected before they reach the engine (and before a request's model
         # field can trigger a switch).
@@ -454,7 +293,7 @@ class Supervisor:
         }
 
         self._lock = threading.RLock()
-        # Serializes whole stop/settle/launch lifecycles so the switch,
+        # Serializes whole stop/launch lifecycles so the switch,
         # reaper, and watcher threads can never launch engines in parallel.
         self._op_lock = threading.RLock()
         # Requests currently being forwarded to the running engine.  A
@@ -489,12 +328,6 @@ class Supervisor:
         self._crash_times: list[float] = []
         self._crash_loop = False  # 3 crashes in 60s; auto-restart parked
         self._last_failed_child: subprocess.Popen | None = None
-        self._last_stopped_footprint: int | None = None
-        self._last_wired_baseline: int | None = None  # wired just before the
-        # last deliberate stop
-        self._launch_available_baseline: int | None = None  # available just
-        # before the current
-        # model loaded
         self._relaunching: str | None = None  # set while a (re)launch runs
         self._stop = threading.Event()
         self._proxy_server: http_server.BaseServer | None = None
@@ -783,7 +616,6 @@ class Supervisor:
             with self._op_lock:
                 self._wait_for_in_flight()
                 self._stop_child()
-                self._settle_memory(_model_memory_need(model))
                 self._launch_child(model, wait_ready=True)
             if self._stop.is_set():
                 return
@@ -863,7 +695,6 @@ class Supervisor:
         # Defense in depth: never start a second engine while one is alive.
         self._stop_child()
         environment = self._child_environment()
-        self._launch_available_baseline = _vm_stat_available_bytes()
         last_error: Exception | None = None
         for _attempt in range(3):
             if self._stop.is_set():
@@ -949,8 +780,6 @@ class Supervisor:
             self._child_ready = False
         if child is None or child.poll() is not None:
             return
-        self._last_stopped_footprint = self._stopped_footprint(child)
-        self._last_wired_baseline = _vm_stat_wired_bytes()
         child.terminate()
         try:
             child.wait(timeout=15)
@@ -960,24 +789,6 @@ class Supervisor:
                 child.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 pass
-
-    def _stopped_footprint(self, child: subprocess.Popen) -> int | None:
-        """How much memory the stopped engine held, in bytes.
-
-        ``ps`` RSS undercounts a file-backed engine (its weights live in the
-        page cache, not in RSS), so the number that matters for the *next*
-        model is how far *available* memory fell since this one launched: that
-        is the cache the kernel must reclaim before the next model fits.  RSS
-        is kept as a floor for the case where the launch baseline was
-        unmeasured.
-        """
-        candidates: list[int] = []
-        if rss := _process_tree_rss(child.pid):
-            candidates.append(rss)
-        baseline = self._launch_available_baseline
-        if baseline is not None and (current := _vm_stat_available_bytes()) is not None:
-            candidates.append(max(0, baseline - current))
-        return max(candidates) if candidates else None
 
     def _relay_output(self, child: subprocess.Popen) -> None:
         assert child.stdout is not None
@@ -997,186 +808,6 @@ class Supervisor:
                     tail_bytes -= tail.popleft()
         except (OSError, ValueError):
             pass  # the pipe closed; the watcher is the authoritative signal
-
-    def _settle_memory(self, need: int | None = None) -> None:
-        """Wait (bounded) for the machine to make room for the next model.
-
-        A just-stopped engine leaves its memory behind in two pools the next
-        engine cannot use:
-
-        * *available* (free + inactive + speculative + purgeable): the
-          stopped engine's file-backed weight pages linger in *active*
-          memory and only become reclaimable as the kernel demotes them,
-          which on a busy machine is slow (10-60s, in plateaus) — leaving
-          too little for the next model's weight pages and sparse KV.
-        * *wired* (device memory, capped by ``iogpu.wired_limit_mb``
-          independently of ``available``): the killed engine's GPU buffers
-          stay wired until the iogpu collector reclaims them asynchronously,
-          and the next engine's Metal maps fail against the old engine's
-          still-counted wired memory ("Q4 buffer is below plan requirement"
-          with plenty of ``available``).
-
-        The available target is the greater of the next model's known
-        requirement (``need``) and "available at stop + 80% of the stopped
-        engine's footprint", capped at 60% of physical RAM so a loaded
-        machine still has a reachable goal.  When available is below that
-        and the machine has headroom, a brief allocate/free pressure pass
-        nudges the kernel to demote the stale cache now instead of waiting
-        it out.
-
-        A pool is done once it reaches its target, or is flat for ~15s
-        *and* available is already at the next model's requirement.  A pool
-        that cannot be measured is treated as cleared: the engine's own
-        planner is the final judge, and its output says why.  If the
-        budget runs out with available still below the next model's need,
-        we proceed anyway but warn clearly.
-        """
-        if self.settle_timeout <= 0 or self._stop.is_set():
-            return
-        physical = _physical_memory_bytes()
-        floor = int(physical * 0.6) if physical else None
-        available = _vm_stat_available_bytes()
-        footprint = self._last_stopped_footprint
-        estimate = (
-            available + int(footprint * 0.8)
-            if available is not None and footprint
-            else None
-        )
-        lower = [value for value in (need, estimate) if value]
-        target = max(lower) if lower else floor
-        if lower and floor is not None:
-            target = min(floor, target)  # the 60% cap bounds a loaded machine
-
-        # Nudge the kernel to demote the stale cache now rather than waiting
-        # the full budget for it to happen on its own.  Sized to the stopped
-        # engine's footprint (the cache to reclaim), capped by available so
-        # a loaded machine is never pushed toward OOM, and capped
-        # absolutely.
-        if (
-            self._evict_cache
-            and not self._stop.is_set()
-            and target is not None
-            and available is not None
-            and available < target
-        ):
-            size = int(
-                min(
-                    footprint or max(0, target - available),
-                    available * 0.4,
-                    EVICT_CAP,
-                )
-            )
-            if size > 0:
-                print(
-                    f"serve-multi · reclaiming the stopped engine's cache "
-                    f"({_gib(size)} GiB pressure pass)",
-                    flush=True,
-                )
-                _evict_stale_cache(size)
-                available = _vm_stat_available_bytes()
-
-        wired_ceiling = None
-        if self._last_wired_baseline is not None:
-            wired_ceiling = self._last_wired_baseline + 2 * 1024**3
-        wired = _vm_stat_wired_bytes() if wired_ceiling is not None else None
-        avail_ok = target is None or available is None or available >= target
-        wired_ok = wired_ceiling is None or wired is None or wired <= wired_ceiling
-        if available is None and (wired_ceiling is None or wired is None):
-            return  # cannot measure; let the engine's planner judge
-        if avail_ok and wired_ok:
-            return  # both pools already clear
-        shown_target = _gib(target) if target else "n/a"
-        shown_wired = (
-            f", {_gib(wired)} GiB wired, ceiling {_gib(wired_ceiling)} GiB"
-            if wired_ceiling is not None and wired is not None
-            else ""
-        )
-        print(
-            f"serve-multi · waiting for memory to settle "
-            f"({_gib(available) if available is not None else 'n/a'} GiB available, "
-            f"target {shown_target} GiB{shown_wired})",
-            flush=True,
-        )
-        deadline = time.monotonic() + self.settle_timeout
-        avail_samples: deque[int] = deque(maxlen=30)  # ~15s of 0.5s samples
-        wired_samples: deque[int] = deque(maxlen=30)
-        if available is not None:
-            avail_samples.append(available)
-        if wired is not None:
-            wired_samples.append(wired)
-        avail_done = avail_ok
-        wired_done = wired_ok
-        plateaued = False
-        while time.monotonic() < deadline and not self._stop.is_set():
-            time.sleep(0.5)
-            available = _vm_stat_available_bytes()
-            if wired_ceiling is not None:
-                wired = _vm_stat_wired_bytes()
-            if available is None and (wired_ceiling is None or wired is None):
-                return  # cannot measure; let the engine's planner judge
-            if available is None:
-                avail_done = True  # unmeasurable; the engine will judge
-            if not avail_done and available is not None:
-                avail_samples.append(available)
-                if target is not None and available >= target:
-                    avail_done = True  # fully settled
-                elif (
-                    len(avail_samples) == avail_samples.maxlen
-                    and max(avail_samples) - min(avail_samples) < 0.5 * 1024**3
-                    and (need is None or available >= need)
-                ):
-                    avail_done = True  # flat, but enough for the next model
-                    plateaued = True
-            if wired is None and wired_ceiling is not None:
-                wired_done = True  # unmeasurable; the engine will judge
-            if not wired_done and wired_ceiling is not None and wired is not None:
-                wired_samples.append(wired)
-                if wired <= wired_ceiling:
-                    wired_done = True  # the GPU arena is actually free
-                elif (
-                    len(wired_samples) == wired_samples.maxlen
-                    and max(wired_samples) - min(wired_samples) < 0.5 * 1024**3
-                ):
-                    wired_done = True  # the collector has stalled; proceed
-                    plateaued = True
-            if avail_done and wired_done:
-                if plateaued:
-                    print(
-                        "serve-multi · memory plateaued "
-                        f"({_gib(available) if available is not None else 'n/a'} "
-                        f"GiB available, "
-                        f"{_gib(wired) if wired is not None else 'n/a'} GiB wired); "
-                        "proceeding",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        "serve-multi · memory settled "
-                        f"({_gib(available) if available is not None else 'n/a'} "
-                        f"GiB available, "
-                        f"{_gib(wired) if wired is not None else 'n/a'} GiB wired); "
-                        "loading",
-                        flush=True,
-                    )
-                return
-        if need is not None and available is not None and available < need:
-            print(
-                f"serve-multi · WARNING: only "
-                f"{_gib(available)} GiB is available but the next model needs "
-                f"about {_gib(need)} GiB; it will likely fail to load. Close "
-                "other memory-heavy apps (another model server, ...) and retry.",
-                file=sys.stderr,
-                flush=True,
-            )
-        print(
-            f"serve-multi · memory did not settle within "
-            f"{self.settle_timeout:.0f}s "
-            f"({_gib(available) if available is not None else 'n/a'} GiB available, "
-            f"target {shown_target} GiB, "
-            f"{_gib(wired) if wired is not None else 'n/a'} GiB wired); "
-            "proceeding anyway",
-            flush=True,
-        )
 
     def _watch_child(self, child: subprocess.Popen) -> None:
         """Run until the child exits; restart on unexpected death."""
@@ -1210,7 +841,6 @@ class Supervisor:
                                 and self._child.poll() is None
                             ):
                                 return  # someone already revived the engine
-                        self._settle_memory(_model_memory_need(model))
                         self._launch_child(model, wait_ready=True)
                 finally:
                     self._release_restart()
@@ -1267,7 +897,6 @@ class Supervisor:
                     with self._lock:
                         if self._child is not None and self._child.poll() is None:
                             return
-                    self._settle_memory(_model_memory_need(model))
                     self._launch_child(model, wait_ready=True)
             finally:
                 self._release_restart()
@@ -1286,7 +915,6 @@ class Supervisor:
             with self._op_lock:
                 self._wait_for_in_flight()
                 self._stop_child()
-                self._settle_memory(_model_memory_need(canonical))
                 self._launch_child(canonical, wait_ready=True)
             if self._stop.is_set():
                 return  # shutting down; do not commit an unready model
@@ -1317,7 +945,6 @@ class Supervisor:
                 )
                 try:
                     with self._op_lock:
-                        self._settle_memory(_model_memory_need(previous))
                         self._launch_child(previous, wait_ready=True)
                 except (RuntimeError, OSError) as restore_error:
                     print(
@@ -1887,8 +1514,6 @@ def serve_multi(args) -> int:
         api_key = validate_api_key(api_key)
     shared: dict = {
         "switch_timeout": args.switch_timeout,
-        "switch_settle": args.switch_settle,
-        "evict_cache": getattr(args, "evict_cache", True),
         "api_key": api_key,
         "allowed_host": _flag_values(passthrough, "--allowed-host"),
         "passthrough": _engine_arguments(passthrough),
@@ -2041,12 +1666,6 @@ def _engine_arguments(passthrough: list[str]) -> list[str]:
     return out
 
 
-def _gib(n: int | None) -> str:
-    if n is None:
-        return "n/a"
-    return f"{n / 1024**3:.1f}"
-
-
 def _main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     # Serve flags go after '--' and are passed through to every engine.
@@ -2073,31 +1692,6 @@ def _main(argv=None):
             "seconds a request waits while its model loads "
             "(default 600; 0 = answer 503 immediately)"
         ),
-    )
-    parser.add_argument(
-        "--switch-settle",
-        type=float,
-        default=None,
-        help=(
-            "after stopping the current engine, wait up to this many seconds "
-            "for its memory to be reclaimed before launching the next one; "
-            "the wait ends early once the target is reached or memory is "
-            "truly flat (default 60; 0 disables)"
-        ),
-    )
-    parser.add_argument(
-        "--evict-cache",
-        action="store_true",
-        default=True,
-        help="nudge macOS to reclaim the stopped engine's file cache before "
-        "launching the next model (default: on)",
-    )
-    parser.add_argument(
-        "--no-evict-cache",
-        dest="evict_cache",
-        action="store_false",
-        help="skip the stale-cache pressure pass; faster switches but higher "
-        "risk of 'Q4 buffer below plan' failures",
     )
     args, unknown = parser.parse_known_args(argv)
     if unknown:
