@@ -1749,7 +1749,7 @@ class _ServeMultiHandler(http_server.BaseHTTPRequestHandler):
             return
         try:
             try:
-                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+                conn = http.client.HTTPConnection("127.0.0.1", port)
                 conn.request(method, path, body, self._forward_headers(port))
                 try:
                     self._write_upstream_response(conn.getresponse())
