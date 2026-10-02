@@ -61,8 +61,8 @@ RUNTIME_DIR = paths.RUNTIME
 # the server package next to install/; make the repo root importable.
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from server.errors import APIError  # noqa: E402
-from server.http_security import (  # noqa: E402
+from server.errors import APIError
+from server.http_security import (
     authenticate,
     validate_api_key,
     validate_headers,
@@ -85,11 +85,11 @@ def _ensure_installed(model: str) -> None:
                 ["make", "-j4", "all"],
             ):
                 if subprocess.run(
-                    command, cwd=ROOT, pass_fds=(lock.fileno(),)
+                    command, cwd=ROOT, pass_fds=(lock.fileno(),), check=False
                 ).returncode:
                     raise RuntimeError("source build failed; see the output above")
     check = subprocess.run(
-        [str(paths.BINARY), "device-check"], capture_output=True, text=True
+        [str(paths.BINARY), "device-check"], capture_output=True, text=True, check=False
     )
     if check.returncode:
         report = check.stderr.strip()
@@ -115,7 +115,7 @@ def _ensure_installed(model: str) -> None:
             command[-1:-1] = [flag, value]
     if selection.language_only:
         command.insert(-1, "--language-only")
-    if subprocess.run(command, cwd=ROOT).returncode:
+    if subprocess.run(command, cwd=ROOT, check=False).returncode:
         raise RuntimeError("model download or verification failed")
 
 
@@ -162,7 +162,7 @@ def load_config(path: str | Path) -> list[dict]:
     except json.JSONDecodeError as error:
         raise ValueError(f"config {path} is not valid JSON: {error}") from None
     if not isinstance(document, dict):
-        raise ValueError("config must be a JSON object with a 'models' list")
+        raise TypeError("config must be a JSON object with a 'models' list")
     unknown = sorted(set(document) - {"models"})
     if unknown:
         raise ValueError(
@@ -171,12 +171,12 @@ def load_config(path: str | Path) -> list[dict]:
         )
     raw = document.get("models")
     if not isinstance(raw, list):
-        raise ValueError("config 'models' must be an array")
+        raise TypeError("config 'models' must be an array")
     out: list[dict] = []
     for index, entry in enumerate(raw):
         where = f"models[{index}]"
         if not isinstance(entry, dict):
-            raise ValueError(
+            raise TypeError(
                 f"{where} must be an object like "
                 '{{"model": "OWNER/REPO", "aliases": [...], "max_context": ...}}'
             )
@@ -227,7 +227,7 @@ def load_config(path: str | Path) -> list[dict]:
             arguments = []
         preload = entry.get("preload", False)
         if not isinstance(preload, bool):
-            raise ValueError(f"{where}: 'preload' must be true or false")
+            raise TypeError(f"{where}: 'preload' must be true or false")
         out.append(
             {
                 "model": model,
@@ -625,7 +625,8 @@ class Supervisor:
                 self._switch_done.set()
             self._drain_queue()
             print(f"serve-multi · now serving {model}", flush=True)
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 — deliberate: contain any engine failure
+
             with self._lock:
                 self._switching = False
                 self._switch_target = None
@@ -924,7 +925,8 @@ class Supervisor:
                 self._switch_done.set()
             self._drain_queue()
             print(f"serve-multi · switched to {model}", flush=True)
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 — deliberate: fall back to previous model
+
             # Try to restore the previous model before giving up (unless the
             # request was rejected before the current engine was touched).
             # The switching state is kept for the whole restore — new
@@ -1261,7 +1263,8 @@ class _ServeMultiHandler(http_server.BaseHTTPRequestHandler):
             handed_off = True
             self._forward("POST", self.path, body, held_model=req_model)
             return 200
-        except Exception as error:
+        except Exception as error:  # noqa: BLE001 — deliberate: release the held request
+
             if not handed_off:
                 self.supervisor.end_hold(req_model)
             print(

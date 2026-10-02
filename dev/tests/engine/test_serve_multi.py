@@ -140,7 +140,7 @@ class ConfigLoadingTests(unittest.TestCase):
             json.dump(config, f)
             path = f.name
         try:
-            with self.assertRaises(ValueError):
+            with self.assertRaises(TypeError):
                 serve_multi.load_config(path)
         finally:
             Path(path).unlink()
