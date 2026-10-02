@@ -19,19 +19,26 @@ required, and no in-flight request is ever cut short.
   "models": [
     {"model": "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M", "aliases": ["code-27b"]},
     {"model": "unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M",
-     "aliases": ["code-35b-a3b"], "max_context": 131072}
+     "aliases": ["code-35b-a3b"], "arguments": ["--max-context", "131072"]}
   ]
 }
 ```
 
 ```bash
 splash serve-multi --config models.json
+splash serve-multi --config models.json -- --port 8001 --no-webui
 ```
 
-No engine runs until the first request arrives; that request's model (by
-repo ID or alias) is what loads first. Any config model that is not
-installed yet is downloaded and prepared before the proxy starts accepting
-traffic.
+Only the `serve-multi`-specific options are parsed before `--`; everything
+after `--` uses `splash serve` syntax and is passed through to every
+engine instance unchanged (see [Options](#options)).
+
+By default no engine runs until the first request arrives; that request's
+model (by repo ID or alias) is what loads first. A model with
+`"preload": true` loads as soon as serve-multi starts instead; when
+several models set it, the earliest one in the list wins and the later ones
+are ignored. Any config model that is not installed yet is downloaded and
+prepared before the proxy starts accepting traffic.
 
 ### Config file
 
@@ -41,10 +48,15 @@ The top level is a JSON object with a single `models` list. Each entry:
 | --- | --- | --- |
 | `model` | yes | Repo ID to serve, e.g. `OWNER/REPO` or `OWNER/REPO:VARIANT`. |
 | `aliases` | no | Extra API model IDs, as in [`--served-model-name`](../DEVELOPMENT.md#api-model-aliases). |
-| `max_context` | no | Context limit in tokens for this model. |
+| `arguments` | no | Extra `splash serve` flags for this model's engine only: an array of `--flag` strings, or one shell-like string, e.g. `["--max-context", "64000", "--kv-format", "bf16"]`. |
+| `max_context` | no | Context limit in tokens for this model; shorthand for `["--max-context", "<N>"]` in `arguments`. |
+| `preload` | no | Load this model when serve-multi starts, instead of waiting for the first request. If several models set it, only the earliest one in the list loads. |
 
-Shared CLI flags take precedence over per-model values, e.g.
-`--max-context 100K` beats `"max_context": 131072`.
+When the same flag appears in several places, the value from the later
+layer wins, flag by flag — serve flags after `--` > per-model
+`arguments` > the `max_context` key. E.g. `-- --max-context 100K` overrides
+`["--max-context", "64000"]` for every model, while other per-model flags
+such as `--kv-format bf16` keep applying.
 
 ### How a switch works
 
@@ -97,12 +109,28 @@ full list):
 | `--switch-settle SECONDS` | `60` | How long to wait for the stopped engine's memory to be reclaimed before launching the next model; the wait ends early once the target is reached or memory is flat. `0` disables. |
 | `--no-evict-cache` | off | Skip the stale-cache reclaim pass. Faster switches, higher risk of `Q4 buffer below plan` failures. |
 
-The shared flags — `--host`, `--port`, `--default-reasoning-effort`,
-`--kv-format`, `--max-memory`, `--max-cache-disk`, `--max-context`,
-`--allowed-host`, `--max-request-size`, `--max-image-pixels`, `--api-key`,
-`--no-webui` — have the same meaning as on `splash serve` and apply to every
-engine instance. Per-model selection (`--revision`, `--draft-model`,
-`--language-only`) is part of the model ID itself, not a shared flag.
+### Serve flags after `--`
+
+Any `splash serve` flag may be given after `--`, with its usual meaning, and
+is forwarded verbatim to every engine instance, e.g.
+
+```bash
+splash serve-multi --config models.json -- --port 8001 --max-context 128K \
+    --kv-format bf16 --no-webui
+```
+
+A few behave slightly differently from `splash serve` because the engines
+run behind the proxy:
+
+- `--host` and `--port` configure the **proxy**; each engine always binds an
+  internal free port on loopback that the proxy forwards to.
+- `--api-key` (or `SPLASH_API_KEY`) is enforced by the proxy and reaches the
+  engines through the `SPLASH_API_KEY` environment.
+- `--model` does not apply — the model is selected per request.
+- Launcher-level selection flags (`--revision`, `--draft-model`,
+  `--language-only`) are not supported; the GGUF variant goes in the model
+  ID, and per-engine differences belong in per-model
+  [`arguments`](#config-file).
 
 ### Memory between models
 
