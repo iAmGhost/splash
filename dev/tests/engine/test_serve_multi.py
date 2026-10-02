@@ -168,34 +168,42 @@ class ArgumentParsingTests(unittest.TestCase):
         self.assertEqual(args.command, "serve-multi")
         self.assertEqual(args.config, "/tmp/config.json")
 
-    def test_serve_multi_shares_flags_with_serve(self):
+    def test_serve_multi_serve_flags_pass_through_after_separator(self):
+        """'splash serve' flags are given after '--' and kept verbatim for
+        the engine instances; serve-multi only parses its own flags before
+        the separator."""
         args = launcher.parse_args(
             [
                 "serve-multi",
                 "--config",
                 "/tmp/config.json",
+                "--",
                 "--host",
                 "0.0.0.0",
                 "--port",
                 "9999",
                 "--kv-format",
                 "bf16",
-                "--max-memory",
-                "28G",
-                "--max-context",
-                "128K",
                 "--api-key",
                 "secret",
                 "--no-webui",
             ]
         )
-        self.assertEqual(args.host, "0.0.0.0")
-        self.assertEqual(args.port, 9999)
-        self.assertEqual(args.kv_format, "bf16")
-        self.assertEqual(args.max_memory, 28 * 1024**3)
-        self.assertEqual(args.max_context, 131072)
-        self.assertEqual(args.api_key, "secret")
-        self.assertTrue(args.no_webui)
+        self.assertEqual(args.config, "/tmp/config.json")
+        self.assertEqual(
+            args.client_args,
+            [
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "9999",
+                "--kv-format",
+                "bf16",
+                "--api-key",
+                "secret",
+                "--no-webui",
+            ],
+        )
 
     def test_serve_multi_default_switch_timeouts(self):
         args = launcher.parse_args(["serve-multi", "--config", "/tmp/config.json"])
@@ -212,78 +220,6 @@ class ArgumentParsingTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.switch_timeout, 30.0)
-
-    def test_serve_multi_shared_flags_duplicated(self):
-        # Confirm shared flags match what 'serve' supports.
-        serve_args = launcher.parse_args(
-            [
-                "serve",
-                "--model",
-                "owner/repo",
-                "--host",
-                "0.0.0.0",
-                "--port",
-                "9999",
-                "--kv-format",
-                "bf16",
-                "--max-memory",
-                "28G",
-                "--max-context",
-                "128K",
-                "--max-request-size",
-                "256M",
-                "--max-image-pixels",
-                "1000000",
-                "--api-key",
-                "secret",
-                "--no-webui",
-                "--allowed-host",
-                "example.com",
-            ]
-        )
-        multi_args = launcher.parse_args(
-            [
-                "serve-multi",
-                "--config",
-                "/tmp/config.json",
-                "--host",
-                "0.0.0.0",
-                "--port",
-                "9999",
-                "--kv-format",
-                "bf16",
-                "--max-memory",
-                "28G",
-                "--max-context",
-                "128K",
-                "--max-request-size",
-                "256M",
-                "--max-image-pixels",
-                "1000000",
-                "--api-key",
-                "secret",
-                "--no-webui",
-                "--allowed-host",
-                "example.com",
-            ]
-        )
-        for attr in (
-            "host",
-            "port",
-            "kv_format",
-            "max_memory",
-            "max_context",
-            "max_request_size",
-            "max_image_pixels",
-            "api_key",
-            "no_webui",
-            "allowed_host",
-        ):
-            with self.subTest(attr=attr):
-                self.assertEqual(
-                    getattr(serve_args, attr),
-                    getattr(multi_args, attr),
-                )
 
     def test_main_dispatches_to_serve_multi(self):
         """When args.command == 'serve-multi', main calls serve_multi.serve_multi."""
@@ -1887,8 +1823,8 @@ class SupervisorTests(unittest.TestCase):
                 self.assertEqual(supervisor.active_model, "owner/repo-b")
                 launch.assert_called_with("owner/repo-b", wait_ready=True)
 
-    def test_load_first_model_lazy(self):
-        """_load_first_model should launch the first model when none is running."""
+    def test_load_initial_model_lazy(self):
+        """_load_initial_model should launch the model when none is running."""
         supervisor = serve_multi.Supervisor(
             [
                 {"model": "owner/repo-a", "aliases": ["alias-a"]},
@@ -1907,7 +1843,7 @@ class SupervisorTests(unittest.TestCase):
             with mock.patch.object(supervisor, "_stop_child"):
                 # No model is currently running
                 self.assertIsNone(supervisor.active_model)
-                result = supervisor._load_first_model()
+                result = supervisor._load_initial_model("owner/repo-b")
                 self.assertTrue(result)
                 # Should have initiated loading
                 for _ in range(40):
@@ -1915,11 +1851,11 @@ class SupervisorTests(unittest.TestCase):
                     if not supervisor.switching:
                         break
                 self.assertFalse(supervisor.switching)
-                self.assertEqual(supervisor.active_model, "owner/repo-a")
-                launch.assert_called_with("owner/repo-a", wait_ready=True)
+                self.assertEqual(supervisor.active_model, "owner/repo-b")
+                launch.assert_called_with("owner/repo-b", wait_ready=True)
 
-    def test_load_first_model_no_op_when_running(self):
-        """_load_first_model should return True without loading if a model is already running."""
+    def test_load_initial_model_no_op_when_running(self):
+        """_load_initial_model should return True without loading if a model is already running."""
         supervisor = serve_multi.Supervisor(
             [{"model": "owner/repo-a"}],
             {"switch_timeout": 600.0},
@@ -1928,7 +1864,7 @@ class SupervisorTests(unittest.TestCase):
         )
         supervisor._active_model = "owner/repo-a"
         with mock.patch.object(supervisor, "_launch_child") as launch:
-            result = supervisor._load_first_model()
+            result = supervisor._load_initial_model("owner/repo-a")
             self.assertTrue(result)
             launch.assert_not_called()
 
