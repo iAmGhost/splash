@@ -161,6 +161,17 @@ class AnthropicAdapterTest(unittest.TestCase):
         self.assertEqual(translated["response_format"]["json_schema"]["schema"], SCHEMA)
         self.assertEqual(translated["tools"][0]["function"]["name"], "lookup")
 
+    def test_a_strict_tool_stays_strict(self):
+        body = request_body(
+            tools=[
+                {"name": "lookup", "input_schema": {"type": "object"}, "strict": True}
+            ],
+        )
+        translated = anthropic_to_chat_prompt(
+            body, thinking_resolver=no_signed_thinking
+        )
+        self.assertIs(translated["tools"][0]["function"]["strict"], True)
+
     def test_format_shape_validation_is_independent_of_thinking(self):
         invalid = [
             {"output_config": value} for value in (None, [], "json_schema", False)
@@ -237,9 +248,13 @@ class AnthropicHTTPContractTest(unittest.TestCase):
 
     def test_keep_all_forwards_history_and_agrees_with_generation_count(self):
         class InputTokenizer(test_server.FakeTokenizer):
-            def apply_chat_template(self, messages, **kwargs):
-                prefix = super().apply_chat_template(messages, **kwargs)
-                return json.dumps([messages, kwargs], sort_keys=True) + prefix
+            def apply_chat_template(
+                self, messages, add_generation_prompt=False, **kwargs
+            ):
+                prompt = super().apply_chat_template(
+                    messages, add_generation_prompt=add_generation_prompt, **kwargs
+                )
+                return json.dumps([messages, kwargs], sort_keys=True) + prompt
 
             def __call__(self, text, **_kwargs):
                 return {"input_ids": list(text.encode())}

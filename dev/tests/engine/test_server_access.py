@@ -5,6 +5,7 @@ import json
 import os
 import unittest
 from unittest import mock
+from xml.etree import ElementTree
 
 from openai import AuthenticationError, OpenAI
 
@@ -182,6 +183,8 @@ class ServerAccessTests(unittest.TestCase):
             {"Authorization": "Bearer test-server-key"},
             {"Authorization": "bearer test-server-key"},
             {"x-api-key": "test-server-key"},
+            # Anthropic's SDK with both an API key and an auth token.
+            {"Authorization": "Bearer test-server-key", "x-api-key": "test-server-key"},
         ):
             self.assertEqual(
                 harness.request("GET", "/v1/models", headers=headers)[0], 200
@@ -189,18 +192,33 @@ class ServerAccessTests(unittest.TestCase):
         for headers in (
             {"Authorization": "Bearer incorrect"},
             {"Authorization": "Basic test-server-key"},
-            {"Authorization": "Bearer test-server-key", "x-api-key": "test-server-key"},
+            {"Authorization": "Bearer incorrect", "x-api-key": "test-server-key"},
+            {"Authorization": "Bearer test-server-key", "x-api-key": "incorrect"},
+            {"Authorization": "Basic test-server-key", "x-api-key": "test-server-key"},
         ):
             self.assertEqual(
                 harness.request("GET", "/v1/models", headers=headers)[0], 401
             )
+        for name, value in (
+            ("Authorization", "Bearer test-server-key"),
+            ("x-api-key", "test-server-key"),
+        ):
+            connection = http.client.HTTPConnection(*harness.server.server_address)
+            self.addCleanup(connection.close)
+            connection.putrequest("GET", "/v1/models")
+            connection.putheader(name, value)
+            connection.putheader(name, value)
+            connection.endheaders()
+            response = connection.getresponse()
+            response.read()
+            self.assertEqual(response.status, 401)
 
     def test_public_probes_and_optional_webui(self):
         harness = self.harness(api_key="test-server-key", webui=False)
         for method in ("GET", "HEAD"):
             for path in ("/health", "/ready"):
                 self.assertEqual(harness.request(method, path)[0], 200)
-            for path in ("/", "/index.html?test=1"):
+            for path in ("/", "/index.html?test=1", "/favicon.ico"):
                 self.assertEqual(harness.request(method, path)[0], 404)
         default = self.harness()
         self.assertEqual(default.request("GET", "/")[0], 200)
@@ -209,6 +227,13 @@ class ServerAccessTests(unittest.TestCase):
         status, _, html = protected.request("GET", "/")
         self.assertEqual(status, 200)
         self.assertNotIn(b"test-server-key", html)
+        # The page's icon, which browsers fetch without the key.
+        self.assertIn(
+            b'<link rel="icon" href="/favicon.ico" type="image/svg+xml">', html
+        )
+        status, content_type, icon = protected.request("GET", "/favicon.ico")
+        self.assertEqual((status, content_type), (200, "image/svg+xml"))
+        self.assertTrue(ElementTree.fromstring(icon).tag.endswith("svg"))
 
     def test_cli_key_precedence_and_validation(self):
         for parse, arguments in (

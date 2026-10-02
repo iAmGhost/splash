@@ -5,6 +5,8 @@ import gc
 import http.client
 import io
 import json
+import math
+import socket
 import threading
 import time
 import unittest
@@ -33,6 +35,14 @@ class HttpBodyBudgetTests(unittest.TestCase):
                 return
             time.sleep(0.005)
         self.assertEqual(harness.server.request_bodies.stats()["active"], amount)
+
+    def wait_connections(self, harness, count, seconds):
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            if harness.server.connections.stats()["active"] == count:
+                return
+            time.sleep(0.005)
+        self.assertEqual(harness.server.connections.stats()["active"], count)
 
     def headers(self, harness, length, path="/v1/chat/completions"):
         connection = http.client.HTTPConnection(
@@ -185,6 +195,50 @@ class HttpBodyBudgetTests(unittest.TestCase):
                 self.assertEqual(response.status, status)
                 response.read()
 
+    def _refused_upload(self, harness, sent, length):
+        upload = socket.create_connection(harness.server.server_address, timeout=5)
+        self.addCleanup(upload.close)
+        upload.sendall(
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+            b"Content-Type: application/json\r\n"
+            + f"Content-Length: {length}\r\n\r\n".encode()
+            + b" " * sent
+        )
+        return upload
+
+    def test_a_refusal_reaches_a_client_that_pauses_its_upload(self):
+        size = 256 * 1024
+        with mock.patch.object(api, "DEFAULT_REQUEST_BODY_BUDGET", 2 * size):
+            harness = self.harness(max_request_bytes=size, queue_size=4, timeout=15)
+        held = [self.headers(harness, size) for _ in range(2)]
+        self.wait_bytes(harness, 2 * size)
+        # The shared budget is full, so the server refuses this body unread;
+        # the client sends half, pauses past the 2 s after which the server
+        # used to stop receiving a refused upload, then sends the rest in
+        # chunks.
+        refused = self._refused_upload(harness, size // 2, size)
+        time.sleep(2.5)
+        for _ in range(8):
+            refused.sendall(b" " * (size // 16))
+            time.sleep(0.01)
+        response = http.client.HTTPResponse(refused)
+        response.begin()
+        self.assertEqual(response.status, 503)
+        self.assertIn("request body capacity", response.read().decode())
+        # The server is done with the connection once all of the upload has
+        # arrived, though the client keeps it open.
+        self.wait_connections(harness, len(held), 0.5)
+
+    def test_a_refused_upload_that_stalls_is_dropped(self):
+        harness = self.harness(max_request_bytes=128, io_timeout=1)
+        refused = self._refused_upload(harness, 50, 200)
+        response = http.client.HTTPResponse(refused)
+        response.begin()
+        self.assertEqual(response.status, 413)
+        self.wait_connections(harness, 1, 0.5)
+        # Like any upload, it may pause for the inactivity timeout, no longer.
+        self.wait_connections(harness, 0, 2)
+
     def test_parsed_bodies_stay_charged_while_preparation_is_pending(self):
         with mock.patch.object(api, "DEFAULT_REQUEST_BODY_BUDGET", 4096):
             harness = self.harness(max_request_bytes=1024, queue_size=8)
@@ -246,7 +300,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
             self.wait_bytes(harness, 0)
         with mock.patch.object(harness.backend, "submit", return_value=False):
             self.assertEqual(
-                harness.request("POST", "/v1/chat/completions", body)[0], 429
+                harness.request("POST", "/v1/chat/completions", body)[0], 503
             )
         self.wait_bytes(harness, 0)
 
@@ -401,6 +455,7 @@ class HttpBodyBudgetTests(unittest.TestCase):
             (1024, 1800, 30 + 1 / 512),
             (128 * 1024**2, 1800, 286),
             (256 * 1024**2, 1800, 542),
+            (256 * 1024**2, math.inf, 542),
             (128 * 1024**2, 5, 5),
         ):
             with self.subTest(length=length, request_seconds=request_seconds):

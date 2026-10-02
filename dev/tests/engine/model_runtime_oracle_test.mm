@@ -37,6 +37,33 @@ void require(bool condition, const std::string &message) {
     fail(message);
 }
 
+std::string mebibytes(uint64_t bytes) {
+  return std::to_string(bytes >> 20) + " MiB";
+}
+
+// The oracle loads and allocates without production's memory guard, and it
+// injects every refusal its checks expect. When other programs hold memory it
+// needs, the run stops here with the numbers: a check would otherwise fail
+// for the wrong reason, or catch the refusal as its own.
+[[noreturn]] void stopForHostMemory(const std::string &refusal,
+                                    uint64_t availableBytes,
+                                    uint64_t reserveBytes) {
+  std::cerr << "model_runtime_oracle_test: FAIL: " << refusal
+            << ", and macOS has " << mebibytes(availableBytes)
+            << " available and keeps " << mebibytes(reserveBytes)
+            << "; close other programs and retry\n";
+  std::exit(1);
+}
+
+// A refusal of the memory governor for host memory, with what it measured.
+[[noreturn]] void stopForHostMemory(const MemoryGovernor &governor,
+                                    const std::string &need, uint64_t bytes) {
+  const MemoryGovernorSnapshot host = governor.snapshot();
+  stopForHostMemory("the memory governor refused " + mebibytes(bytes) +
+                        " for " + need,
+                    host.hostAvailableBytes, host.hostReserveBytes);
+}
+
 constexpr uint32_t kVocabulary = 248320;
 constexpr uint32_t kMaskWords = (kVocabulary + 31) / 32;
 
@@ -443,7 +470,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
                     : executor.begin(image.modelView())).granted(),
             "image could not retry after an execution lane became free");
     executor.end(image.id);
-    while (executor.reclaimIdleState()) {
+    while (executor.reclaimIdleState(false)) {
     }
     require(backend.memoryStats().allocatedBytes == originalBytes,
             "full-lane image test leaked resources");
@@ -487,13 +514,13 @@ void requireAtomicImageAdmission(model::Runtime &executor,
           require(threw == throwing, "image admission exception was lost");
           require(backend.memoryStats().allocatedBytes == before,
                   "failed image admission retained or removed shared buffers");
-          require(executor.reclaimIdleState() == 0,
+          require(executor.reclaimIdleState(false) == 0,
                   "failed image admission created false reclamation progress");
         }
       }
       if (sharedVision) {
         executor.end(keeper.id);
-        while (executor.reclaimIdleState()) {
+        while (executor.reclaimIdleState(false)) {
         }
       }
     }
@@ -502,7 +529,7 @@ void requireAtomicImageAdmission(model::Runtime &executor,
                     : executor.begin(image.modelView())).granted(),
             "image request could not retry after allocation failure");
     executor.end(image.id);
-    while (executor.reclaimIdleState()) {
+    while (executor.reclaimIdleState(false)) {
         }
     require(backend.memoryStats().allocatedBytes == originalBytes,
             "image admission test leaked resources");
@@ -521,7 +548,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
                                   model::QwenStateStorage &states,
                                   const model::ModelPackage &model,
                                   AllocationFault &fault) {
-  while (executor.reclaimIdleState()) {
+  while (executor.reclaimIdleState(false)) {
   }
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   const uint64_t encodesBefore = executor.telemetry().imageEncodes;
@@ -546,7 +573,7 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
                BatchCohort::Greedy, false);
   // Nothing else is idle, so the pass releases exactly the encoder arena.
   uint64_t reclaimed = 0;
-  while (const uint64_t bytes = executor.reclaimIdleState())
+  while (const uint64_t bytes = executor.reclaimIdleState(false))
     reclaimed += bytes;
   const uint64_t encoderBytes = ops::Vision::scratchBytes(
       model.vision.tensors.layout, ops::kMaximumImagePatches);
@@ -620,13 +647,13 @@ void requireImageRowsAfterReclaim(model::Runtime &executor,
   // frees nothing, so the reclaimer must not credit those bytes.
   const uint64_t heldBytes = backend.memoryStats().allocatedBytes;
   uint64_t released = 0;
-  while (const uint64_t bytes = executor.reclaimIdleState())
+  while (const uint64_t bytes = executor.reclaimIdleState(false))
     released += bytes;
   require(released == heldBytes - backend.memoryStats().allocatedBytes,
           "reclaim credited cached rows a live request still holds");
   executor.end(request.id);
 
-  while (executor.reclaimIdleState()) {
+  while (executor.reclaimIdleState(false)) {
   }
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "image requests leaked resources");
@@ -637,7 +664,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
                                      metal::MetalBackend &backend,
                                      model::QwenStateStorage &states,
                                      AllocationFault &fault) {
-  while (executor.reclaimIdleState()) {
+  while (executor.reclaimIdleState(false)) {
   }
   const uint64_t originalBytes = backend.memoryStats().allocatedBytes;
   std::vector<uint32_t> prompt(128);
@@ -653,7 +680,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
   const uint64_t singleImageBytes =
       backend.memoryStats().allocatedBytes - originalBytes;
   executor.end(request.id);
-  while (executor.reclaimIdleState()) {
+  while (executor.reclaimIdleState(false)) {
   }
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "single image allocation fixture retained memory");
@@ -692,7 +719,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
           "repeated image placements encoded more than once");
   const auto expected = sampleCommittedState(states, slot);
   executor.end(request.id);
-  while (executor.reclaimIdleState()) {
+  while (executor.reclaimIdleState(false)) {
   }
 
   // The first placement is covered by the prefix, but its later duplicates
@@ -710,7 +737,7 @@ void requireRepeatedImagePlacements(model::Runtime &executor,
                           true);
   executor.end(request.id);
   checkpoint.reset();
-  while (executor.reclaimIdleState()) {
+  while (executor.reclaimIdleState(false)) {
   }
   require(backend.memoryStats().allocatedBytes == originalBytes,
           "repeated image placements retained resources");
@@ -806,8 +833,6 @@ int main(int argc, char **argv) {
     const auto hostAvailableBytes = queryHostAvailableMemory();
     require(hostAvailableBytes.has_value(),
             "cannot measure available host memory before loading the oracle model");
-    require(*hostAvailableBytes > hostReserveBytes,
-            "available host memory does not cover the protected macOS reserve");
     const std::filesystem::path modelRoot(argv[2]);
     const auto descriptor = model::inspectModelPackage(modelRoot);
     // Production's weight byte count with a different bound. Production checks
@@ -815,10 +840,12 @@ int main(int argc, char **argv) {
     // Metal operation while loading. This oracle has no such guard, so the
     // prepared weights must fit in reclaimable memory above the macOS reserve
     // before anything is mapped; it can refuse a package production starts.
-    require(model::preparedModelWeightBytes(modelRoot, descriptor) <=
-                *hostAvailableBytes - hostReserveBytes,
-            "oracle model loading exceeds available host memory after protecting " +
-                std::to_string(hostReserveBytes) + " bytes for macOS");
+    const uint64_t weightBytes =
+        model::preparedModelWeightBytes(modelRoot, descriptor);
+    if (*hostAvailableBytes <= hostReserveBytes ||
+        weightBytes > *hostAvailableBytes - hostReserveBytes)
+      stopForHostMemory("the prepared weights need " + mebibytes(weightBytes),
+                        *hostAvailableBytes, hostReserveBytes);
     model::ModelPackage model =
         model::loadModelPackage(backend, modelRoot, descriptor);
     ops::ExecutionPlans operators(backend.capabilities());
@@ -851,9 +878,17 @@ int main(int argc, char **argv) {
     const uint64_t elasticGrowthCeiling = budget.hardBudgetBytes -
         budget.pipelineReserveBytes - budget.runtimeOverheadReserveBytes;
     MemoryGovernor governor(backend, elasticGrowthCeiling, hostReserveBytes);
+    const metal::AllocationAdmission governed =
+        [admit = governor.allocationAdmission(), &governor](
+            uint64_t bytes, const std::function<void()> &allocate) {
+          const metal::AllocationResult result = admit(bytes, allocate);
+          if (result.failure == metal::AllocationFailure::HostPressure)
+            stopForHostMemory(governor, "an allocation", bytes);
+          return result;
+        };
     AllocationFault allocationFault;
     const metal::AllocationAdmission admission =
-        [admit = governor.allocationAdmission(), &allocationFault, &backend](
+        [admit = governed, &allocationFault, &backend](
             uint64_t bytes, const std::function<void()> &allocate) {
           if (bytes > allocationFault.remainingBytes)
             return false;
@@ -879,7 +914,7 @@ int main(int argc, char **argv) {
     metal::AllocationFailure kvAdmissionFailure = metal::AllocationFailure::None;
     kv::PageStorage pages(
         backend,
-        [governed = governor.allocationAdmission(), &kvAdmissionFailure](
+        [&governed, &kvAdmissionFailure](
             uint64_t bytes, const std::function<void()> &allocate)
             -> metal::AllocationResult {
           if (kvAdmissionFailure != metal::AllocationFailure::None)
@@ -898,11 +933,14 @@ int main(int argc, char **argv) {
                 std::numeric_limits<uint64_t>::max() -
                     executorPlan.sharedPrefillPlannedAllocatedBytes,
             "oracle runtime arena reservation overflows");
-    auto arenaReservation = governor.tryReserve(
-        executorPlan.sharedPrefillPlannedAllocatedBytes +
-        executorPlan.sharedDecodePlannedAllocatedBytes);
+    const uint64_t arenaBytes = executorPlan.sharedPrefillPlannedAllocatedBytes +
+                                executorPlan.sharedDecodePlannedAllocatedBytes;
+    metal::AllocationFailure arenaFailure = metal::AllocationFailure::None;
+    auto arenaReservation = governor.tryReserve(arenaBytes, &arenaFailure);
+    if (arenaFailure == metal::AllocationFailure::HostPressure)
+      stopForHostMemory(governor, "the runtime arenas", arenaBytes);
     require(arenaReservation.has_value(),
-            "oracle runtime arenas would consume the protected macOS memory reserve");
+            "oracle runtime arenas exceed the oracle Metal budget");
     if (warmupEosOnly) {
       warmupEos(context, model);
       return 0;

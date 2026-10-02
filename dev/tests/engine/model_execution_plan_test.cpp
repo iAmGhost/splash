@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <type_traits>
+#include <vector>
 
 namespace {
 
@@ -152,7 +153,7 @@ void checkMixedLayouts() {
   target.layers.front().gateProjection = up;
   require(target.logitsProjection.layout() == ops::WeightLayout::Affine64,
           "mixed fixture must keep an affine vocabulary head");
-  for (uint32_t family : {9U, 10U}) {
+  for (uint32_t family : {9U, 10U, 11U}) {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 16;
@@ -200,6 +201,47 @@ void checkMixedLayouts() {
   try { static_cast<void>(model::qwenTargetGeometry(moe)); }
   catch (const model::WeightStoreError &) { mixedRejected = true; }
   require(mixedRejected, "a target mixing MoE layouts reached execution");
+}
+
+// One decode arena serves every lane count, and on Apple10 and later a
+// Split128 plan's partials grow with the rows. The arena must hold every
+// lane's plan of every affine target and draft projection, including an
+// installed choice at eight splits, at the measured core counts.
+void checkLaneScratch(const model::ModelPackage &package) {
+  const auto geometry = model::RuntimeGeometry::from(package);
+  const auto &d = geometry.draft;
+  std::vector<ops::LinearMatrix> matrices{
+      {d.dynamicSize, d.hiddenSize}, {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
+      {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
+      {d.selectorRank, d.hiddenSize}, {d.hiddenSize, d.targetHiddenSize}};
+  for (const auto &p : geometry.target.decodeProjections)
+    if (p.layout == ops::WeightLayout::Affine64) matrices.push_back({p.outputSize, p.inputSize});
+  const ops::LinearWorkload chosen{{d.hiddenSize, d.targetHiddenSize}, model::kLaneCount * model::kDecodeRows,
+                                   ops::LinearPhase::Decode, ops::LinearEpilogue::None};
+  for (uint32_t family : {10U, 11U})
+    for (uint32_t cores : {12U, 20U, 40U}) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = cores;
+      ops::ExecutionPlans plans(device);
+      ops::OperatorChoices choices;
+      choices.linear.push_back({chosen, {ops::LinearTile::Split128, d.hiddenSize / 128,
+                                         ops::LinearSimdgroups::Eight, 8}});
+      plans.install(choices);
+      const auto scratch = model::DecodeArena::linearScratchSize(geometry, plans);
+      for (const auto matrix : matrices)
+        for (uint32_t lanes = 1; lanes <= model::kLaneCount; ++lanes)
+          for (auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::Residual,
+                                ops::LinearEpilogue::GateUp}) {
+            const auto need = plans.linear().plan({matrix, lanes * model::kDecodeRows,
+                ops::LinearPhase::Decode, epilogue}).scratchSize();
+            require(scratch.partials >= need.partials && scratch.counters >= need.counters,
+                    "decode arena scratch below a lane's affine plan");
+          }
+      require(plans.linear().plan(chosen).configuration().splits == 8 &&
+                  scratch.partials >= plans.linear().plan(chosen).scratchSize().partials,
+              "decode arena scratch lost the installed split choice");
+    }
 }
 
 // Arenas are sized from the projections the weights hold, so each must have
@@ -252,10 +294,12 @@ int main() {
     checkMixedLayouts();
     const auto dense = package<model::Qwen3_8Weights>();
     const auto sparse = package<model::Qwen3_6MoeWeights>();
-    for (uint32_t family : {9U, 10U}) {
+    for (uint32_t family : {9U, 10U, 11U}) {
       checkPackage(dense, family);
       checkPackage(sparse, family);
     }
+    checkLaneScratch(dense);
+    checkLaneScratch(sparse);
     std::cout << "model execution plans: PASS (two paired geometries)\n";
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

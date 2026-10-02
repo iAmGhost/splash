@@ -208,14 +208,22 @@ MemoryGovernor::tryReserve(uint64_t bytes, metal::AllocationFailure *failure) {
       hostAvailable, reservedBytes_);
   bool engineFits = !overflows && observed <= limitBytes_ &&
                     requested <= limitBytes_ - observed;
-  bool hostFits =
-      hostHeadroomBytes(hostAvailable, requested) >= kHostWarningMarginBytes;
+  // Growth leaves the warning margin free above the host's reserve, except
+  // back to the serving footprint: that is what a request is served from,
+  // and a pressure pass that released it must not leave the server unable
+  // to start one while other applications hold the margin.
+  const bool withinServingFootprint =
+      !overflows && observed <= servingFootprintBytes_ &&
+      requested <= servingFootprintBytes_ - observed;
+  const uint64_t hostRoom = hostHeadroomBytes(hostAvailable, 0);
+  const uint64_t hostMargin = withinServingFootprint ? 0 : kHostWarningMarginBytes;
+  bool hostFits = requested <= hostRoom && hostRoom - requested >= hostMargin;
   // A request that only the host headroom refuses waits for host memory
   // while the idle headroom may still clear the margin. Hold host pressure
   // so the paced reclaim frees toward the recovery margin for it.
   if (engineFits && !hostFits)
     hostConstrained_ = true;
-  if (!engineFits || !hostFits || hostHeld() ||
+  if (!engineFits || !hostFits || (hostHeld() && !withinServingFootprint) ||
       pressure == MemoryPressure::Critical) {
     if (failure)
       *failure = !engineFits ? metal::AllocationFailure::EngineBudget
@@ -252,6 +260,11 @@ void MemoryGovernor::setPressure(MemoryPressure pressure) noexcept {
   systemPressure_ = pressure;
 }
 
+void MemoryGovernor::markServingFootprint() noexcept {
+  std::lock_guard lock(mutex_);
+  servingFootprintBytes_ = observedResidentBytes(true);
+}
+
 void MemoryGovernor::reclaimed(ReclaimOutcome outcome) noexcept {
   if (outcome == ReclaimOutcome::Untargeted)
     return;
@@ -278,6 +291,7 @@ MemoryGovernorSnapshot MemoryGovernor::snapshot() const noexcept {
   return {
       limitBytes_,
       observed,
+      servingFootprintBytes_,
       reservedBytes_,
       used < limitBytes_ ? limitBytes_ - used : 0,
       effectivePressure,
@@ -329,10 +343,13 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
     return {};
   }
   if (snapshot.pressure == MemoryPressure::Critical) {
-    return {true, true, std::numeric_limits<uint64_t>::max()};
+    return {.reclaimEmptyKvExtents = true,
+            .evictAllUnpinnedPrefixes = true,
+            .targetBytes = std::numeric_limits<uint64_t>::max()};
   }
   if (nowMilliseconds < nextReclaimMilliseconds_)
-    return continued_.value_or(MemoryReclaimDirective{true, false, 0});
+    return continued_.value_or(MemoryReclaimDirective{
+        .reclaimEmptyKvExtents = true, .keepServingFootprint = true});
   // The host samples every 500 ms. Allow counters to settle between batches,
   // but keep responding if another application continues consuming memory.
   nextReclaimMilliseconds_ = nowMilliseconds + 1000.0;
@@ -342,7 +359,7 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // cache must be discarded. Empty backing can still be returned.
   if (!snapshot.hostMeasurementValid &&
       snapshot.systemPressure == MemoryPressure::Normal)
-    return {true, false, 0};
+    return {.reclaimEmptyKvExtents = true, .keepServingFootprint = true};
 
   uint64_t desired = snapshot.hostHeadroomBytes < kHostRecoveryMarginBytes
       ? kHostRecoveryMarginBytes - snapshot.hostHeadroomBytes
@@ -350,8 +367,10 @@ MemoryReclaimDirective MemoryPressurePolicy::update(
   // Recovering the last stretch to the watermark is worth far less than the
   // resume point it would otherwise discard, so a pass with nothing waiting
   // keeps that publication and takes the rest. A waiting request outranks it.
-  return {true, false, std::min(desired, kHostWarningMarginBytes),
-          !requestWaiting};
+  return {.reclaimEmptyKvExtents = true,
+          .targetBytes = std::min(desired, kHostWarningMarginBytes),
+          .keepResumePoint = !requestWaiting,
+          .keepServingFootprint = true};
 }
 
 void MemoryPressurePolicy::reclaimed(const MemoryReclaimDirective &directive,

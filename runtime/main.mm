@@ -1,3 +1,4 @@
+#include "StderrLine.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/FdTransport.hpp"
 #include "engine/Bootstrap.hpp"
@@ -15,9 +16,9 @@
 #include <charconv>
 #include <csignal>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
-#include <iostream>
 #include <limits.h>
 #include <memory>
 #include <stdexcept>
@@ -52,6 +53,7 @@ struct NativeArguments final {
   uint64_t maxMemoryBytes = 0;
   uint64_t maxCacheDiskBytes = 0;
   kv::Format kvFormat = kv::Format::Int8;
+  double decodeShare = engine::EngineConfig{}.decodeShare;
 };
 
 // One observer spans bootstrap and serving. The dispatch queue only records
@@ -119,10 +121,11 @@ private:
 };
 
 void printUsage(std::string_view executable) {
-  std::cerr << "usage: " << executable
-            << " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
-               " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
-               " [--kv-format int8|bf16]\n";
+  writeStderrLine(
+      "usage: " + std::string(executable) +
+      " serve-native TARGET_DIRECTORY DRAFT_DIRECTORY"
+      " MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto [MAX_CACHE_DISK_BYTES]"
+      " [--kv-format int8|bf16] [--decode-share SHARE]");
 }
 
 template <typename T>
@@ -151,6 +154,16 @@ uint32_t parseMaxContext(std::string_view value,
     throw UsageError("MAX_CONTEXT must be auto or an integer in [1, " +
                      std::to_string(capabilities.maximumContextTokens) + "]");
   }
+  return result;
+}
+
+double parseDecodeShare(std::string_view value) {
+  double result = 0.0;
+  const char *end = value.data() + value.size();
+  auto parsed = std::from_chars(value.data(), end, result);
+  if (parsed.ec != std::errc{} || parsed.ptr != end || !std::isfinite(result) ||
+      result < 0.0)
+    throw UsageError("--decode-share requires a nonnegative number");
   return result;
 }
 
@@ -186,18 +199,24 @@ NativeArguments parseArguments(int argc, char **argv) {
   }
   NativeArguments result;
   int next = 6;
-  if (next < argc && std::string_view(argv[next]) != "--kv-format") {
+  if (next < argc && !std::string_view(argv[next]).starts_with("--")) {
     const std::string_view quota(argv[next++]);
     if (quota != "0" && !parsePositive(quota, result.maxCacheDiskBytes))
       throw UsageError("MAX_CACHE_DISK_BYTES must be a nonnegative integer");
   }
-  if (next < argc) {
-    if (argc - next != 2 || std::string_view(argv[next]) != "--kv-format")
-      throw UsageError("expected --kv-format int8 or bf16");
-    const std::string_view format(argv[next + 1]);
-    if (format != "int8" && format != "bf16")
-      throw UsageError("--kv-format requires int8 or bf16");
-    result.kvFormat = format == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+  // Options follow as --name value pairs; a missing value fails its check.
+  for (; next < argc; next += 2) {
+    const std::string_view option(argv[next]);
+    const std::string_view value(next + 1 < argc ? argv[next + 1] : "");
+    if (option == "--kv-format") {
+      if (value != "int8" && value != "bf16")
+        throw UsageError("--kv-format requires int8 or bf16");
+      result.kvFormat = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
+    } else if (option == "--decode-share") {
+      result.decodeShare = parseDecodeShare(value);
+    } else {
+      throw UsageError("unexpected argument " + std::string(option));
+    }
   }
   result.modelRoot = requireModelRoot(argv[2], argv[3]);
   result.model = model::inspectModelPackage(result.modelRoot);
@@ -247,6 +266,7 @@ bootstrapConfig(const NativeArguments &arguments) {
   config.resources.maximumCacheDiskBytes = arguments.maxCacheDiskBytes;
   config.resources.kvFormat = arguments.kvFormat;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
+  config.nativeLoop.engine.decodeShare = arguments.decodeShare;
   config.nativeLoop.engineInstanceId = engineInstanceId();
   config.nativeLoop.maskWordsPerToken = maskWordsPerToken;
   config.protocolLimits.maxTokenBatch =
@@ -342,9 +362,9 @@ int runNative(const NativeArguments &arguments) {
       if (!recoveryDeadline)
         throw;
       if (!reportedRecoveryWait) {
-        std::cerr
-            << "Waiting for sufficient available memory to start; "
-               "the macOS reserve remains protected...\n";
+        writeStderrLine(
+            "Waiting for sufficient available memory to start; "
+            "the macOS reserve remains protected...");
         reportedRecoveryWait = true;
       }
       const auto resumeAt = std::min(
@@ -358,9 +378,6 @@ int runNative(const NativeArguments &arguments) {
   }
   if (transport.shutdownRequested())
     return static_cast<int>(engine::NativeProcessExit::CleanEof);
-  // Serving handles shutdown and memory pressure between engine ticks.
-  // The per-operation guard is only needed during bootstrap.
-  bootstrap->resources().backend().setOperationGuard({});
   published = bootstrap.get();
 
   transport.setControlHandler([&pressureMonitor, published,
@@ -381,7 +398,7 @@ int runNative(const NativeArguments &arguments) {
     const std::string diagnostic =
         memoryReporter.update(wait, memory.growthAllowed);
     if (!diagnostic.empty())
-      std::cerr << diagnostic << '\n';
+      writeStderrLine(diagnostic);
     engine::MemoryReclaimDirective directive =
         pressurePolicy.update(memory, now, wait.memory || wait.suspended);
     if (!directive.reclaimEmptyKvExtents)
@@ -403,24 +420,26 @@ int runNative(const NativeArguments &arguments) {
   case engine::NativeProcessExit::CleanEof:
     break;
   case engine::NativeProcessExit::ProtocolFailure:
-    std::cerr << "error: native transport stopped after a protocol failure\n";
+    writeStderrLine(
+        "error: native transport stopped after a protocol failure");
     break;
   case engine::NativeProcessExit::EngineFailure:
-    std::cerr << "error: native transport stopped after an engine failure ("
-              << bootstrap->nativeLoop().engineFailure() << ")\n";
+    writeStderrLine(
+        "error: native transport stopped after an engine failure (" +
+        bootstrap->nativeLoop().engineFailure() + ")");
     break;
   case engine::NativeProcessExit::IoFailure:
-    std::cerr << "error: native transport stopped after an I/O failure\n";
+    writeStderrLine(
+        "error: native transport stopped after an I/O failure");
     break;
   }
   return static_cast<int>(exit);
 }
 
 void printBootstrapError(const engine::RuntimeBootstrapReport &report) {
-  std::cerr << "error: " << report.describe() << '\n';
-  if (!report.memoryPlanJson.empty()) {
-    std::cerr << "memory_plan_json: " << report.memoryPlanJson << '\n';
-  }
+  writeStderrLine("error: " + report.describe());
+  if (!report.memoryPlanJson.empty())
+    writeStderrLine("memory_plan_json: " + report.memoryPlanJson);
 }
 
 // The engine's device rule, which the launcher runs before any download:
@@ -429,7 +448,7 @@ int checkDevice() {
   const auto message = metal::probeDeviceCapabilities().validationMessage();
   if (!message)
     return 0;
-  std::cerr << "error: " << *message << '\n';
+  writeStderrLine("error: " + *message);
   return static_cast<int>(engine::NativeProcessExit::EngineFailure);
 }
 
@@ -444,7 +463,7 @@ int main(int argc, char **argv) {
       splash::NativeArguments arguments = splash::parseArguments(argc, argv);
       return splash::runNative(arguments);
     } catch (const splash::UsageError &error) {
-      std::cerr << "error: " << error.what() << '\n';
+      splash::writeStderrLine(std::string("error: ") + error.what());
       splash::printUsage(argc > 0 ? argv[0] : "splash");
       return static_cast<int>(
           splash::engine::NativeProcessExit::ProtocolFailure);
@@ -453,10 +472,11 @@ int main(int argc, char **argv) {
       return static_cast<int>(
           splash::engine::NativeProcessExit::EngineFailure);
     } catch (const std::system_error &error) {
-      std::cerr << "error: native runtime I/O failed: " << error.what() << '\n';
+      splash::writeStderrLine(
+          std::string("error: native runtime I/O failed: ") + error.what());
       return static_cast<int>(splash::engine::NativeProcessExit::IoFailure);
     } catch (const std::exception &error) {
-      std::cerr << "error: " << error.what() << '\n';
+      splash::writeStderrLine(std::string("error: ") + error.what());
       return static_cast<int>(
           splash::engine::NativeProcessExit::EngineFailure);
     }

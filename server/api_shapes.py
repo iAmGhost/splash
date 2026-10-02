@@ -935,6 +935,8 @@ def anthropic_to_chat_prompt(body, *, thinking_resolver):
             }
             if isinstance(tool.get("description"), str):
                 function["description"] = tool["description"]
+            if "strict" in tool:
+                function["strict"] = tool["strict"]
             chat["tools"].append({"type": "function", "function": function})
     choice = body.get("tool_choice")
     if choice is not None:
@@ -1030,6 +1032,44 @@ def completion_response(model, job, result, message, tool_calls):
     }
 
 
+def text_completion_response(model, job, result, text):
+    return {
+        "id": f"cmpl-{job.public_id}",
+        "object": "text_completion",
+        "created": job.created_at,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "text": text,
+                "logprobs": None,
+                "finish_reason": result.reason,
+            }
+        ],
+        "usage": usage_dict(result, job),
+        "metrics": metrics_dict(result),
+        "timings": timings_dict(result),
+    }
+
+
+def _chunk(object_type, chunk_id, created, model, choice, usage, metrics, timings):
+    chunk = {
+        "id": chunk_id,
+        "object": object_type,
+        "created": created,
+        "model": model,
+        "choices": [choice],
+    }
+    if usage is not None:
+        chunk["choices"] = []
+        chunk["usage"] = usage
+    if metrics is not None:
+        chunk["metrics"] = metrics
+    if timings is not None:
+        chunk["timings"] = timings
+    return chunk
+
+
 def stream_chunk(
     model,
     request_id,
@@ -1040,21 +1080,38 @@ def stream_chunk(
     metrics=None,
     timings=None,
 ):
-    chunk = {
-        "id": f"chatcmpl-{request_id}",
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
-    }
-    if usage is not None:
-        chunk["choices"] = []
-        chunk["usage"] = usage
-    if metrics is not None:
-        chunk["metrics"] = metrics
-    if timings is not None:
-        chunk["timings"] = timings
-    return chunk
+    return _chunk(
+        "chat.completion.chunk",
+        f"chatcmpl-{request_id}",
+        created,
+        model,
+        {"index": 0, "delta": delta, "finish_reason": finish_reason},
+        usage,
+        metrics,
+        timings,
+    )
+
+
+def text_completion_chunk(
+    model,
+    request_id,
+    created,
+    text,
+    finish_reason=None,
+    usage=None,
+    metrics=None,
+    timings=None,
+):
+    return _chunk(
+        "text_completion",
+        f"cmpl-{request_id}",
+        created,
+        model,
+        {"index": 0, "text": text, "logprobs": None, "finish_reason": finish_reason},
+        usage,
+        metrics,
+        timings,
+    )
 
 
 def responses_item(job, kind, value, index=0, status="completed"):
@@ -1110,10 +1167,14 @@ def responses_output(
     return output
 
 
-def anthropic_stop(result, tool_calls):
+def anthropic_stop(result, tool_calls, output_clamped_to_context):
     if tool_calls and result.reason != "length":
         return "tool_use"
     if result.reason == "length":
+        # Anthropic's reason when the context window, not max_tokens, ends
+        # the response.
+        if output_clamped_to_context:
+            return "model_context_window_exceeded"
         return "max_tokens"
     if result.stop_sequence is not None:
         return "stop_sequence"
@@ -1166,7 +1227,9 @@ def anthropic_response(
         "role": "assistant",
         "model": model,
         "content": blocks,
-        "stop_reason": anthropic_stop(result, tool_calls),
+        "stop_reason": anthropic_stop(
+            result, tool_calls, job.output_clamped_to_context
+        ),
         "stop_sequence": result.stop_sequence,
         "usage": anthropic_usage(
             result.prompt_tokens, result.completion_tokens, result.cache

@@ -1,5 +1,6 @@
 import array
 import gc
+import math
 import queue
 import struct
 import threading
@@ -31,9 +32,11 @@ class FakeTokenizer:
 
     @staticmethod
     def apply_chat_template(_messages, **kwargs):
-        rendered = "<|im_start|>assistant\n<think>\n"
-        if not kwargs.get("enable_thinking", True):
-            rendered += "\n</think>\n\n"
+        rendered = ""
+        if kwargs.get("add_generation_prompt"):
+            rendered = "<|im_start|>assistant\n<think>\n"
+            if not kwargs.get("enable_thinking", True):
+                rendered += "\n</think>\n\n"
         return rendered if kwargs.get("tokenize") is False else [31, 32, 33]
 
     def __call__(self, _text, **_kwargs):
@@ -251,7 +254,7 @@ class NativeBackendContractTests(unittest.TestCase):
     def test_http_fields_reach_native_generation_request(self):
         transport, runtime = self.make_transport()
         app = make_frontend(
-            FakeTokenizer(), transport, "test-model", 128, 32, 10, 2, vision=True
+            FakeTokenizer(), transport, "test-model", 128, 10, 2, vision=True
         )
         job, _thinking, _tools = app.prepare(
             {
@@ -284,6 +287,8 @@ class NativeBackendContractTests(unittest.TestCase):
         )
         transport, _runtime = self.make_transport(native)
         job = make_job(404, temperature=0.6)
+        job.generation_prompt_tokens = 2
+        job.flags = wire.RequestFlag.IGNORE_END_OF_SEQUENCE
 
         self.assertTrue(transport.submit(job))
         process = factory.processes[0]
@@ -291,6 +296,8 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(frame.priority, wire.RequestPriority.FOREGROUND)
         self.assertEqual(frame.logical_max_output_tokens, 37)
         self.assertEqual(frame.prompt_tokens, (11, 12, 13, 14))
+        self.assertEqual(frame.generation_prompt_tokens, 2)
+        self.assertEqual(frame.flags, wire.RequestFlag.IGNORE_END_OF_SEQUENCE)
         self.assertAlmostEqual(frame.sampling.temperature, 0.6)
         self.assertEqual((frame.sampling.top_p, frame.sampling.top_k), (0.75, 17))
         self.assertEqual(frame.seed, 0x123456789ABCDEF0)
@@ -315,6 +322,33 @@ class NativeBackendContractTests(unittest.TestCase):
             )
         )
         self.assertEqual(self.terminal(job)[0], "done")
+
+    def test_request_without_a_deadline_reaches_the_engine_without_one(self):
+        # Without --request-timeout only a request's own timeout sets one. A
+        # request without either waits as long as a wait can, and the engine
+        # gets the wire's maximum.
+        factory = FakeFactory()
+        native = runtime.MultiplexedRuntime(
+            process_factory=factory,
+            pending_limit=4,
+        )
+        transport, _runtime = self.make_transport(native)
+        app = make_frontend(
+            FakeTokenizer(), transport, "test-model", 128, math.inf, 2, vision=True
+        )
+        self.assertEqual(app.request_deadline({"timeout": 5}, 10), 15)
+        job, _thinking, _tools = app.prepare(
+            {"model": "test-model", "messages": [{"role": "user", "content": "hello"}]}
+        )
+        self.assertEqual(
+            backend_api.remaining_request_time(job.deadline), threading.TIMEOUT_MAX
+        )
+
+        self.assertTrue(transport.submit(job))
+        frame = factory.processes[0].stdin.wait_for(wire.RequestFrame)[0]
+        self.assertEqual(
+            frame.absolute_deadline_unix_micros, backend_api.MAX_PROTOCOL_U64
+        )
 
     def test_score_job_maps_to_score_only_request_and_returns_logits(self):
         factory = FakeFactory()
@@ -533,6 +567,9 @@ class NativeBackendContractTests(unittest.TestCase):
         self.assertEqual(kind, "error")
         self.assertEqual(error.status, 503)
         self.assertEqual(error.code, "runtime_unavailable")
+        # A failure to start, rather than of an engine running the request,
+        # keeps its own reason.
+        self.assertEqual(error.message, "native startup failed")
         self.assertFalse(transport.active)
 
     def test_pending_limit_does_not_leave_active_state(self):

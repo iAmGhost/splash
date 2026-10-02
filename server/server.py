@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import os
 import queue
 import re
@@ -37,6 +38,8 @@ if __package__:
         responses_output,
         responses_response,
         stream_chunk,
+        text_completion_chunk,
+        text_completion_response,
     )
     from .backend import NativeBackend, remaining_request_time
     from .chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
@@ -78,6 +81,8 @@ else:
         responses_output,
         responses_response,
         stream_chunk,
+        text_completion_chunk,
+        text_completion_response,
     )
     from backend import NativeBackend, remaining_request_time
     from chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
@@ -113,16 +118,42 @@ DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024
 MAX_CONTEXT_TOKENS = 262144
 HTTP_IO_TIMEOUT = 30.0
 HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
-# How long a response sent before the request body was read waits for the
-# client to finish uploading it.
-HTTP_UNREAD_BODY_DRAIN_SECONDS = 2.0
 # Native events wake a waiting request at once; this only bounds how late a
 # client disconnect is noticed.
 CLIENT_DISCONNECT_POLL = 0.1
+# How long a connection refused unread may take its client to close.
+REFUSED_LINGER_SECONDS = 2.0
 SSE_KEEPALIVE_SECONDS = 2.0
 NATIVE_START_TIMEOUT = 600.0
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
+# The chat page's brand mark, in its text colors, which the page shows too.
+# Browsers, and other clients, ask for a site's icon at /favicon.ico.
+FAVICON_SVG = Path(__file__).with_name("favicon.svg").read_bytes()
+# The answer to a connection that gets no slot, or gives up its slot before
+# its request is read. With no request path, no API dialect is known: a
+# generic server error with its stable diagnostic code.
+_CONNECTION_OVERLOADED_PAYLOAD = (
+    b'{"error":{"type":"server_error","code":"frontend_overloaded",'
+    b'"message":"HTTP connection capacity is exhausted"}}'
+)
+CONNECTION_OVERLOADED_RESPONSE = (
+    b"HTTP/1.1 503 Service Unavailable\r\n"
+    b"Content-Type: application/json\r\nConnection: close\r\nRetry-After: 1\r\n"
+    b"Content-Length: %d\r\n\r\n%s"
+    % (len(_CONNECTION_OVERLOADED_PAYLOAD), _CONNECTION_OVERLOADED_PAYLOAD)
+)
+
+
+def _content_length(value):
+    """A Content-Length value as a byte count; None when it is not a
+    decimal count, or has more digits than int() converts."""
+    if not value.isascii() or not value.isdigit():
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def _normalize_path(raw_path):
@@ -151,12 +182,20 @@ def _normalize_path(raw_path):
     return normalized
 
 
+def _queue_full():
+    """The answer when the native pending limit refuses a submission. That
+    limit is --queue-size, the HTTP request gate's capacity, so only a race
+    with the gate reaches it, as when a cancelled request still holds its
+    native slot: an overload like the gate's own, retried the same way."""
+    return APIError(503, "request queue is full", "frontend_overloaded")
+
+
 class FrontendHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def setup(self):
         self._response_started = False
-        self._unread_body = False
+        self._unread_body = 0
         self._last_sse_write = time.monotonic()
         super().setup()
         self.connection.settimeout(self.server.io_timeout)
@@ -167,10 +206,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._header_timer.start()
 
     def _expire_headers(self):
-        try:
-            self.connection.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+        self.server.connections.expire(self.connection)
 
     def finish(self):
         self._header_timer.cancel()
@@ -181,14 +217,21 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _discard_unread_body(self):
         # Closing with request bytes unread resets the connection, and the
         # reset can destroy the response before a client still uploading
-        # reads it. Half-close, then discard the upload for a bounded time.
-        deadline = time.monotonic() + HTTP_UNREAD_BODY_DRAIN_SECONDS
+        # reads it. Half-close, then receive the rest of the upload on the
+        # terms a body is read, waiting on the client as a connection with
+        # no request yet does.
+        self.server.connections.draining(self.connection)
         try:
             self.connection.shutdown(socket.SHUT_WR)
-            while (remaining := deadline - time.monotonic()) > 0:
-                self.connection.settimeout(remaining)
-                if not self.rfile.read1(65536):
+            while self._unread_body > 0:
+                remaining = self._upload_deadline - time.monotonic()
+                if remaining <= 0:
                     return
+                self.connection.settimeout(min(remaining, self.server.io_timeout))
+                chunk = self.rfile.read1(min(65536, self._unread_body))
+                if not chunk:
+                    return
+                self._unread_body -= len(chunk)
         except OSError:
             pass
 
@@ -200,16 +243,27 @@ class FrontendHandler(BaseHTTPRequestHandler):
             parsed = super().parse_request()
         finally:
             self._header_timer.cancel()
+        if not self.server.connections.serving(self.connection):
+            self.close_connection = True
+            return False
         if not parsed:
             return False
         if self.request_version not in {"HTTP/1.0", "HTTP/1.1"}:
             self.close_connection = True
             self.send_error(505, "HTTP version not supported")
             return False
-        # finish() drains a body that no handler read before responding.
-        self._unread_body = bool(
-            self.headers.get_all("Content-Length")
-            or self.headers.get_all("Transfer-Encoding")
+        # The body still to come, which finish() receives if no handler
+        # reads it before responding: its stated length or, without a valid
+        # one, as much as the server accepts, in the time an upload gets,
+        # counted from here.
+        lengths = self.headers.get_all("Content-Length", [])
+        length = _content_length(lengths[0]) if len(lengths) == 1 else None
+        if length is not None:
+            self._unread_body = length
+        elif lengths or self.headers.get_all("Transfer-Encoding"):
+            self._unread_body = self.server.max_request_bytes
+        self._upload_deadline = time.monotonic() + self._upload_seconds(
+            min(self._unread_body, self.server.max_request_bytes)
         )
         try:
             allowed_hosts = self.server.allowed_hosts | {
@@ -219,7 +273,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             path = self.path.partition("?")[0]
             public = self.command == "OPTIONS" or (
                 self.command in ("GET", "HEAD")
-                and path in ("/", "/index.html", "/health", "/ready")
+                and path in ("/", "/index.html", "/favicon.ico", "/health", "/ready")
             )
             if not public:
                 authenticate(self.headers, self.server.api_key)
@@ -230,6 +284,20 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
             return False
         return True
+
+    def send_error(self, code, message=None, explain=None):
+        # The stdlib's send_error, which answers requests it cannot parse or
+        # route and parse_request's 505, writes an HTML page. After a request
+        # line it cannot parse, or HTTP/0.9's, request_version is HTTP/0.9,
+        # and it writes that page with no status line or headers. Answer as
+        # any other error, over HTTP/1.1.
+        self.request_version = self.protocol_version
+        path = getattr(self, "path", "").partition("?")[0]
+        self._safe_error(
+            APIError(code, message or self.responses[code][0]),
+            path.startswith("/v1/messages"),
+            log=False,
+        )
 
     @property
     def app(self):
@@ -306,6 +374,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
+    def _upload_seconds(self, length):
+        # Inactivity allowed at any point, plus the body at the upload rate.
+        return self.server.io_timeout + length / HTTP_UPLOAD_BYTES_PER_SECOND
+
     def _read_json_body(self, deadline):
         if self.headers.get_all("Transfer-Encoding"):
             raise APIError(400, "transfer encoding is not supported")
@@ -327,9 +399,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         lengths = self.headers.get_all("Content-Length", [])
         if len(lengths) != 1:
             raise APIError(400, "exactly one Content-Length header is required")
-        if not lengths[0].isascii() or not lengths[0].isdigit():
+        length = _content_length(lengths[0])
+        if length is None:
             raise APIError(400, "invalid Content-Length header")
-        length = int(lengths[0])
         if length <= 0:
             raise APIError(400, "request body must not be empty")
         if length > self.server.max_request_bytes:
@@ -340,12 +412,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "request_too_large",
             )
         # Bound total upload time even when a client keeps the socket active.
-        deadline = min(
-            deadline,
-            time.monotonic()
-            + self.server.io_timeout
-            + length / HTTP_UPLOAD_BYTES_PER_SECOND,
-        )
+        deadline = min(deadline, time.monotonic() + self._upload_seconds(length))
         self._body_reservation = RequestBodyReservation(
             self.server.request_bodies, length
         )
@@ -360,8 +427,8 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 if not chunk:
                     raise APIError(400, "request body ended before Content-Length")
                 payload.extend(chunk)
-            self._unread_body = False
         finally:
+            self._unread_body = length - len(payload)
             self.connection.settimeout(self.server.io_timeout)
         text = payload.decode(json.detect_encoding(payload), "surrogatepass")
         payload.clear()
@@ -382,11 +449,13 @@ class FrontendHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.partition("?")[0]
-        if path in ("/", "/index.html"):
-            if self.server.webui:
-                self._send(200, CHAT_HTML, "text/html; charset=utf-8")
-            else:
+        if path in ("/", "/index.html", "/favicon.ico"):
+            if not self.server.webui:
                 self._safe_error(APIError(404, "not found", "not_found"))
+            elif path == "/favicon.ico":
+                self._send(200, FAVICON_SVG, "image/svg+xml")
+            else:
+                self._send(200, CHAT_HTML, "text/html; charset=utf-8")
             return
         if path == "/health":
             self._json(200, {"status": "ok"})
@@ -483,8 +552,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
         prompt_only = count_tokens or path in ("/tokenize", "/apply-template")
         anthropic = path == "/v1/messages" or count_tokens
         systemone = path == "/v1/systemone"
+        completions = path == "/v1/completions"
         if path not in (
             "/v1/chat/completions",
+            "/v1/completions",
             "/v1/responses",
             "/v1/messages",
             "/v1/messages/count_tokens",
@@ -562,7 +633,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 if self._client_disconnected():
                     raise ConnectionResetError("client disconnected before submission")
                 if not self.app.backend.submit(job):
-                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                    raise _queue_full()
                 submitted = True
                 self._judgment_complete(job, row)
                 return
@@ -586,6 +657,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                         body, thinking_resolver=self.app.thinking_codec.decode
                     ),
                     deadline=deadline,
+                    output_field="max_tokens",
                     clamp_output_budget=True,
                 )
                 stream_options = None
@@ -609,7 +681,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 stream_options = {
                     "include_usage": stream_options.get("include_usage", False)
                 }
-                job, thinking, has_tools = self.app.prepare(body, deadline=deadline)
+                if completions:
+                    job = self.app.prepare_completion(body, deadline=deadline)
+                    thinking = has_tools = False
+                else:
+                    job, thinking, has_tools = self.app.prepare(body, deadline=deadline)
             body = None
             self._body_reservation.retain_for(job)
             self._body_reservation = None
@@ -619,7 +695,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if self._client_disconnected():
                 raise ConnectionResetError("client disconnected before submission")
             if not self.app.backend.submit(job):
-                raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                raise _queue_full()
             submitted = True
             if anthropic and stream:
                 self._anthropic_stream(job, thinking, has_tools)
@@ -629,6 +705,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 self._responses_stream(job, thinking, has_tools)
             elif responses:
                 self._responses_complete(job, thinking, has_tools)
+            elif completions and stream:
+                self._text_completion_stream(job, stream_options)
+            elif completions:
+                self._text_completion(job)
             elif stream:
                 self._stream(job, thinking, has_tools, stream_options)
             else:
@@ -715,7 +795,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 # queue bound and lets later questions reuse the state prefix.
                 active_job = job
                 if not self.app.backend.submit(job):
-                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
+                    raise _queue_full()
                 result = None
                 while result is None:
                     kind, value = self._next_event(job)
@@ -906,6 +986,10 @@ class FrontendHandler(BaseHTTPRequestHandler):
             200,
             completion_response(self.app.model, job, result, message, bool(tool_calls)),
         )
+
+    def _text_completion(self, job):
+        _, text, _, result, _ = self._collect(job, False, False)
+        self._json(200, text_completion_response(self.app.model, job, result, text))
 
     def _anthropic_complete(self, job, thinking, has_tools):
         reasoning, content, tool_calls, result, _ = self._collect(
@@ -1101,7 +1185,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "message_delta",
                 {
                     "delta": {
-                        "stop_reason": anthropic_stop(result, tool_calls),
+                        "stop_reason": anthropic_stop(
+                            result, tool_calls, job.output_clamped_to_context
+                        ),
                         "stop_sequence": result.stop_sequence,
                     },
                     "usage": {"output_tokens": result.completion_tokens},
@@ -1173,13 +1259,28 @@ class FrontendHandler(BaseHTTPRequestHandler):
         self._last_sse_write = time.monotonic()
 
     def _sse_keepalive(self):
-        # SSE comments are invisible to SDK event decoders but still count as
-        # transport progress. Long prefill and resource waits must not look
-        # like dead connections to strict local-agent idle timers.
+        # An SSE comment is traffic, so socket read timeouts and proxies do
+        # not take a long prefill or resource wait for a dead connection, but
+        # event decoders skip it and clients that time out on missing data
+        # events ignore it. Streams send it only where no data event fits: the
+        # chat and text completion streams until the request starts, the
+        # Responses stream once output has begun.
         self._start_event_stream()
         self.wfile.write(b": splash-keepalive\n\n")
         self.wfile.flush()
         self._last_sse_write = time.monotonic()
+
+    def _sse_error(self, error):
+        self._sse(
+            {
+                "error": {
+                    "message": error.message,
+                    "type": error.protocol_type(),
+                    "code": error.code,
+                }
+            }
+        )
+        self._sse("[DONE]")
 
     def _guarded_stream(self, job, run, send_error):
         try:
@@ -1242,7 +1343,11 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     response=responses_response(self.app.model, job, "in_progress", []),
                 )
             else:
-                # Do not replace already-streamed output with an empty snapshot.
+                # The data event that adds nothing, response.in_progress,
+                # carries a snapshot of the response, which would replace the
+                # output streamed so far. A comment keeps the stream alive
+                # instead, though clients that time out on missing data events
+                # ignore it.
                 self._sse_keepalive()
 
         def start_part(kind, item, index):
@@ -1558,13 +1663,19 @@ class FrontendHandler(BaseHTTPRequestHandler):
                     )
                 )
 
+            def keepalive():
+                # Array/object tool arguments are buffered until complete, which
+                # can take minutes. Clients that time out on missing data events
+                # ignore SSE comments, so send an empty delta chunk instead.
+                self._sse(stream_chunk(self.app.model, public_id, created, {}))
+
             _, _, tool_calls, result, _ = self._collect(
                 job,
                 thinking,
                 has_tools,
                 put_text,
                 put_tool_delta,
-                self._sse_keepalive,
+                keepalive,
                 put_progress,
             )
             self._sse(
@@ -1590,19 +1701,67 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 )
             self._sse("[DONE]")
 
-        def send_error(error):
-            self._sse(
-                {
-                    "error": {
-                        "message": error.message,
-                        "type": error.protocol_type(),
-                        "code": error.code,
-                    }
-                }
+        self._guarded_stream(job, run, self._sse_error)
+
+    def _text_completion_stream(self, job, stream_options):
+        public_id = job.public_id
+
+        def run():
+            first = self._next_event(job, self._sse_keepalive)
+            if first[0] != "start":
+                raise APIError(500, "runtime protocol error", "protocol_error")
+            self._start_event_stream()
+            created = job.created_at
+
+            def put_progress(progress):
+                chunk = text_completion_chunk(self.app.model, public_id, created, "")
+                chunk["prompt_progress"] = progress
+                self._sse(chunk)
+
+            def put_text(_field, text):
+                self._sse(
+                    text_completion_chunk(self.app.model, public_id, created, text)
+                )
+
+            def keepalive():
+                # Clients that time out on missing data events ignore SSE
+                # comments; an empty text chunk is one, as chat's empty
+                # delta is.
+                self._sse(text_completion_chunk(self.app.model, public_id, created, ""))
+
+            _, _, _, result, _ = self._collect(
+                job,
+                False,
+                False,
+                put_text,
+                None,
+                keepalive,
+                put_progress,
             )
+            self._sse(
+                text_completion_chunk(
+                    self.app.model,
+                    public_id,
+                    created,
+                    "",
+                    result.reason,
+                    timings=timings_dict(result),
+                )
+            )
+            if stream_options.get("include_usage"):
+                self._sse(
+                    text_completion_chunk(
+                        self.app.model,
+                        public_id,
+                        created,
+                        "",
+                        usage=usage_dict(result, job),
+                        metrics=metrics_dict(result),
+                    )
+                )
             self._sse("[DONE]")
 
-        self._guarded_stream(job, run, send_error)
+        self._guarded_stream(job, run, self._sse_error)
 
 
 class HttpAdmission:
@@ -1637,6 +1796,211 @@ class HttpAdmission:
     def stats(self):
         with self.lock:
             return {"active": self.active, "capacity": self.capacity}
+
+
+def _refuse_connection(connection):
+    """Send CONNECTION_OVERLOADED_RESPONSE without waiting: the server has
+    read no request from the connection and written it no response, so the
+    response fits in its send buffer."""
+    try:
+        connection.send(CONNECTION_OVERLOADED_RESPONSE, socket.MSG_DONTWAIT)
+    except OSError:
+        pass
+
+
+def _has_input(connection):
+    """Whether `connection` holds input its thread has yet to read, such as
+    a request that arrived before its thread ran."""
+    # A poll object holds no descriptor.
+    poller = select.poll()
+    poller.register(connection, select.POLLIN)
+    return bool(poller.poll(0))
+
+
+class LingeringCloser:
+    """Closes connections answered without reading their requests.
+
+    Closing a connection with request bytes unread resets it, and the reset
+    can destroy the answer before the client reads it. Each connection given
+    here is half-closed instead; one thread reads and drops what its client
+    still sends, and closes it once the client has closed or `linger`
+    seconds after its answer. At most `capacity` wait at once; any beyond
+    them are closed at once.
+    """
+
+    # How soon the thread first reads a connection that arrives while it
+    # waits on others.
+    TICK = 0.05
+
+    def __init__(self, capacity, linger):
+        self.capacity = capacity
+        self.linger = linger
+        self.changed = threading.Condition()
+        self.arrivals = []
+        self.held = 0
+        self.stopped = False
+        self.thread = threading.Thread(
+            target=self._run, name="lingering close", daemon=True
+        )
+        self.thread.start()
+
+    def close(self, connection):
+        try:
+            connection.shutdown(socket.SHUT_WR)
+            connection.setblocking(False)
+        except OSError:
+            connection.close()
+            return
+        with self.changed:
+            if self.stopped or self.held >= self.capacity:
+                connection.close()
+                return
+            self.held += 1
+            self.arrivals.append((connection, time.monotonic() + self.linger))
+            self.changed.notify()
+
+    def stop(self):
+        """Close every waiting connection and end the thread."""
+        with self.changed:
+            self.stopped = True
+            self.changed.notify()
+        self.thread.join()
+
+    def _run(self):
+        # A poll object holds no descriptor.
+        poller = select.poll()
+        waiting = {}
+        while True:
+            with self.changed:
+                while not (waiting or self.arrivals or self.stopped):
+                    self.changed.wait()
+                arrivals, self.arrivals = self.arrivals, []
+                stopped = self.stopped
+            for connection, deadline in arrivals:
+                poller.register(connection, select.POLLIN)
+                waiting[connection.fileno()] = connection, deadline
+            if not stopped:
+                for descriptor, _ in poller.poll(self.TICK * 1000):
+                    connection, _ = waiting[descriptor]
+                    try:
+                        if connection.recv(65536):
+                            continue
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        pass
+                    waiting[descriptor] = connection, 0.0
+            now = time.monotonic()
+            done = [
+                descriptor
+                for descriptor, (_, deadline) in waiting.items()
+                if stopped or deadline <= now
+            ]
+            for descriptor in done:
+                poller.unregister(descriptor)
+                waiting.pop(descriptor)[0].close()
+            with self.changed:
+                self.held -= len(done)
+            if stopped:
+                return
+
+
+class ConnectionSlots:
+    """The connections the server gives a thread, at most `capacity`.
+
+    One that waits for its request with nothing yet to read, or drains an
+    upload refused unread, gives its slot to a new connection when no slot
+    is free, the longest waiting first, so stalled connections, however
+    many and from however many addresses, cannot keep others out. One whose
+    request has arrived keeps its slot, although its thread may not have
+    run yet: when every slot has a request, arrived or in progress, the new
+    connection is refused. One that gives way still awaiting its request
+    gets the 503 of a connection refused at the accept, as its request may
+    be on its way. One draining a refused upload already has its response.
+    """
+
+    # What a connection with a slot is doing.
+    AWAITING_REQUEST = "awaiting request"
+    SERVING = "serving"
+    DRAINING = "draining"
+
+    def __init__(self, capacity):
+        self.capacity = capacity
+        # Each connection with a slot, mapped to what it is doing; those that
+        # wait on their client in the order they began to.
+        self.holders = {}
+        self.lock = threading.Lock()
+        self.idle = threading.Event()
+        self.idle.set()
+
+    def admit(self, connection):
+        """Give `connection` a slot, awaiting its request; False when every
+        slot has a request, arrived or in progress."""
+        with self.lock:
+            if len(self.holders) >= self.capacity:
+                waiting = next(
+                    (
+                        held
+                        for held, state in self.holders.items()
+                        if state == self.DRAINING
+                        or (state == self.AWAITING_REQUEST and not _has_input(held))
+                    ),
+                    None,
+                )
+                if waiting is None:
+                    return False
+                if self.holders[waiting] == self.AWAITING_REQUEST:
+                    _refuse_connection(waiting)
+                self._close(waiting)
+            self.holders[connection] = self.AWAITING_REQUEST
+            self.idle.clear()
+            return True
+
+    def expire(self, connection):
+        """Close `connection`, and free its slot, if it still awaits its
+        request."""
+        with self.lock:
+            if self.holders.get(connection) == self.AWAITING_REQUEST:
+                self._close(connection)
+
+    def _close(self, connection):
+        # Under the lock, which a connection's release takes before the
+        # connection is closed, so the descriptor is still its own. Its
+        # thread sees the end of input; it has lost its slot, so a request
+        # whose headers the shutdown cut short is not served.
+        del self.holders[connection]
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def serving(self, connection):
+        """Mark the request on `connection` in progress; False once the
+        connection has lost its slot."""
+        with self.lock:
+            if connection not in self.holders:
+                return False
+            self.holders[connection] = self.SERVING
+            return True
+
+    def draining(self, connection):
+        """`connection`, answered, drains an upload refused unread: it waits
+        on its client again, last in line."""
+        with self.lock:
+            if self.holders.pop(connection, None) is not None:
+                self.holders[connection] = self.DRAINING
+
+    def release(self, connection):
+        """Give back the slot of `connection`, if it still has one, before
+        the connection is closed."""
+        with self.lock:
+            self.holders.pop(connection, None)
+            if not self.holders:
+                self.idle.set()
+
+    def stats(self):
+        with self.lock:
+            return {"active": len(self.holders), "capacity": self.capacity}
 
 
 class RequestBodyReservation:
@@ -1690,10 +2054,17 @@ class RequestBodyReservation:
 class FrontendServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
+    # Connections the kernel holds until the accept loop takes them. A burst
+    # beyond this queue is reset by the kernel, unseen by the server, so ask
+    # for as many as uvicorn does; the kernel caps it (128 on macOS).
+    # Queued connections take no thread or descriptor.
+    request_queue_size = 2048
     # Keep control/catalog capacity separate from generation capacity.
     # Neither gate allocates workers in advance.
-    request_queue_size = 64
     control_connection_capacity = 64
+    # Connections refused at the accept that wait at once, on one thread,
+    # for their clients to close.
+    refused_connection_capacity = 64
 
     def __init__(
         self,
@@ -1731,8 +2102,11 @@ class FrontendServer(ThreadingHTTPServer):
         self.started_at = time.time()
         self.requests = HttpAdmission(request_capacity)
         self.token_counts = HttpAdmission(request_capacity)
-        self.connections = HttpAdmission(
+        self.connections = ConnectionSlots(
             request_capacity + self.control_connection_capacity
+        )
+        self.refused = LingeringCloser(
+            self.refused_connection_capacity, REFUSED_LINGER_SECONDS
         )
         super().__init__(address, FrontendHandler, bind_and_activate)
         self.app = app
@@ -1757,40 +2131,21 @@ class FrontendServer(ThreadingHTTPServer):
         return status
 
     def process_request(self, request, client_address):
-        if not self.connections.acquire():
-            # Header-only/idle connections must also be bounded. Do not create
-            # a thread or block the accept loop to reject an excess socket.
-            # The request path has not been read, so no API dialect is known.
-            # Keep a generic server error and its stable diagnostic code.
-            payload = b'{"error":{"type":"server_error","code":"frontend_overloaded","message":"HTTP connection capacity is exhausted"}}'
-            response = (
-                b"HTTP/1.1 503 Service Unavailable\r\n"
-                b"Content-Type: application/json\r\nConnection: close\r\nRetry-After: 1\r\n"
-                + f"Content-Length: {len(payload)}\r\n\r\n".encode()
-                + payload
-            )
-            try:
-                request.setblocking(False)
-                request.sendall(response)
-            except OSError:
-                pass
-            finally:
-                self.shutdown_request(request)
+        if not self.connections.admit(request):
+            # Do not create a thread or block the accept loop to reject an
+            # excess socket.
+            _refuse_connection(request)
+            self.refused.close(request)
             return
-        try:
-            super().process_request(request, client_address)
-        except BaseException:
-            self.connections.release()
-            raise
+        super().process_request(request, client_address)
 
-    def process_request_thread(self, request, client_address):
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self.connections.release()
+    def shutdown_request(self, request):
+        self.connections.release(request)
+        super().shutdown_request(request)
 
     def server_close(self):
         super().server_close()
+        self.refused.stop()
         self.connections.idle.wait(min(2.0, self.io_timeout))
 
     def handle_error(self, request, client_address):
@@ -1929,9 +2284,15 @@ def parse_args(argv=None):
         type=_parse_max_cache_disk,
         default=0,
     )
+    parser.add_argument(
+        "--decode-share",
+        type=float,
+        default=None,
+        help="decode time owed per unit of prefill time while other requests "
+        "decode (default: 0.5; 0 alternates one command each)",
+    )
     parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
-    parser.add_argument("--max-new-tokens", type=int, default=32768)
-    parser.add_argument("--request-timeout", type=float, default=1800)
+    parser.add_argument("--request-timeout", type=float, default=None)
     parser.add_argument("--queue-size", type=int, default=32)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--allowed-host", action="append", default=[])
@@ -1952,15 +2313,21 @@ def parse_args(argv=None):
             validate_api_key(args.api_key)
         except ValueError as error:
             parser.error(str(error))
-    if args.max_new_tokens <= 0:
-        parser.error("--max-new-tokens must be positive")
     if not image_input.MIN_PIXELS <= args.max_image_pixels <= image_input.MAX_PIXELS:
         parser.error(
             "--max-image-pixels must be in "
             f"[{image_input.MIN_PIXELS}, {image_input.MAX_PIXELS}]"
         )
-    if not is_finite_number(args.request_timeout) or args.request_timeout <= 0:
+    if args.request_timeout is None:
+        # No deadline unless given, as in vLLM and SGLang; a request still
+        # ends when its client disconnects.
+        args.request_timeout = math.inf
+    elif not is_finite_number(args.request_timeout) or args.request_timeout <= 0:
         parser.error("--request-timeout must be positive and finite")
+    if args.decode_share is not None and (
+        not is_finite_number(args.decode_share) or args.decode_share < 0
+    ):
+        parser.error("--decode-share must be nonnegative and finite")
     if args.queue_size <= 0:
         parser.error("--queue-size must be positive")
     if not 0 <= args.port <= 65535:
@@ -1981,6 +2348,8 @@ def _native_command(args):
         command.append(str(args.max_cache_disk))
     if args.kv_format != "int8":
         command.extend(("--kv-format", args.kv_format))
+    if args.decode_share is not None:
+        command.extend(("--decode-share", str(args.decode_share)))
     return command
 
 
@@ -1999,6 +2368,9 @@ def main():
     signal.signal(signal.SIGTERM, _interrupt)
     signal.signal(signal.SIGINT, _interrupt)
     try:
+        # The launcher blocks both across its exec: one sent while this module
+        # imported arrives here and ends the startup cleanly.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
         # Bind before loading the tokenizer or model so duplicates fail early.
         # Activate only after the runtime is ready, keeping a partially started
         # service from receiving requests.
@@ -2053,7 +2425,6 @@ def main():
             backend,
             args.model,
             effective_context,
-            args.max_new_tokens,
             args.request_timeout,
             readiness.max_concurrent_requests,
             constraint_factory=constraint_factory,
