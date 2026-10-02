@@ -304,6 +304,10 @@ def load_config(path: str | Path) -> list[dict]:
     passes extra serve flags to that model's engine only.  When the same
     flag is also given after '--' on the command line, the command-line
     value wins for every model.
+
+    ``preload`` (true/false) loads the model as soon as serve-multi
+    starts, instead of waiting for the first request; when several models
+    set it, the earliest one in the list wins.
     """
     try:
         text = Path(path).read_text(encoding="utf-8")
@@ -333,7 +337,8 @@ def load_config(path: str | Path) -> list[dict]:
                 '{{"model": "OWNER/REPO", "aliases": [...], "max_context": ...}}'
             )
         unknown = sorted(
-            set(entry) - {"model", "aliases", "max_context", "arguments"}
+            set(entry)
+            - {"model", "aliases", "max_context", "arguments", "preload"}
         )
         if unknown:
             raise ValueError(f"{where}: unknown keys {unknown}")
@@ -376,12 +381,16 @@ def load_config(path: str | Path) -> list[dict]:
                 raise ValueError(f"{where} arguments: {error}") from None
         else:
             arguments = []
+        preload = entry.get("preload", False)
+        if not isinstance(preload, bool):
+            raise ValueError(f"{where}: 'preload' must be true or false")
         out.append(
             {
                 "model": model,
                 "aliases": aliases,
                 "max_context": max_context,
                 "arguments": arguments,
+                "preload": preload,
             }
         )
     if not out:
@@ -746,31 +755,30 @@ class Supervisor:
             name="serve-multi-switch",
         ).start()
 
-    def _load_first_model(self) -> bool:
-        """Load the first (default) model if none is running.  Returns True if
-        loading was initiated, False if already running, already switching, or
-        shutting down."""
+    def _load_initial_model(self, model: str) -> bool:
+        """Load a config model marked 'preload' at startup.  Returns True
+        if loading was initiated, False if something is already running,
+        already switching, or shutting down."""
         with self._lock:
             if self._active_model is not None:
                 return True  # already running
             if self._switching:
                 return False  # another load/switch in progress
-            first = self.model_specs[0]["model"]
             self._switching = True
-            self._switch_target = first
+            self._switch_target = model
             self._switch_done.clear()
-            self._failed_switches.discard(first)
-        print(f"serve-multi · loading first model: {first}", flush=True)
+            self._failed_switches.discard(model)
+        print(f"serve-multi · loading preloaded model: {model}", flush=True)
         threading.Thread(
             target=self._do_load_first,
-            args=(first,),
+            args=(model,),
             daemon=True,
             name="serve-multi-load-first",
         ).start()
         return True
 
     def _do_load_first(self, model: str) -> None:
-        """Load the first model from the config.  Runs in a background thread."""
+        """Load the initial model at startup.  Runs in a background thread."""
         try:
             with self._op_lock:
                 self._wait_for_in_flight()
@@ -1898,7 +1906,7 @@ def serve_multi(args) -> int:
     try:
         # Start the proxy on the user-facing port.
         server = _ForwardingHTTPServer(
-            (args.host, args.port),
+            (host, port),
             functools.partial(_ServeMultiHandler, supervisor=supervisor),
             supervisor=supervisor,
         )
@@ -1915,10 +1923,17 @@ def serve_multi(args) -> int:
         ).start()
         print(
             f"serve-multi · proxy listening on "
-            f"http://{args.host}:{args.port}  (models: "
+            f"http://{host}:{port}  (models: "
             f"{', '.join(m['model'] for m in models)})",
             flush=True,
         )
+        # A model marked 'preload' loads eagerly instead of waiting for
+        # the first request; if several set it, the earliest one wins.
+        initial = next(
+            (m["model"] for m in models if m.get("preload")), None
+        )
+        if initial is not None:
+            supervisor._load_initial_model(initial)
         # Block until a signal calls supervisor.shutdown().
         while not supervisor._stop.is_set():
             time.sleep(0.5)
