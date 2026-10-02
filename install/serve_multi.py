@@ -653,7 +653,7 @@ class Supervisor:
             child = subprocess.Popen(
                 self._child_command(model, spec, port),
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=None,
                 env=environment,
                 cwd=str(ROOT),
             )
@@ -747,15 +747,19 @@ class Supervisor:
         # Shared with _output_tail so a crash report can quote the last lines.
         child._splash_output_tail = tail
         try:
-            for line in iter(child.stdout.readline, b""):
-                if self._stop.is_set():
+            # read1, not readline: model-download progress (tqdm) repaints
+            # with carriage returns and no newlines, so relaying line by line
+            # would hold it back until the whole download finished.
+            while not self._stop.is_set():
+                chunk = child.stdout.read1(65536)
+                if not chunk:
                     break
-                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.write(chunk)
                 sys.stdout.buffer.flush()
-                tail.append(line)
-                tail_bytes += len(line)
+                tail.append(chunk)
+                tail_bytes += len(chunk)
                 while tail_bytes > 32768 and len(tail) > 1:
-                    tail_bytes -= tail.popleft()
+                    tail_bytes -= len(tail.popleft())
         except (OSError, ValueError):
             pass  # the pipe closed; the watcher is the authoritative signal
 
