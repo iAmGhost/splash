@@ -46,8 +46,8 @@ from http import server as http_server
 from pathlib import Path
 
 if __package__:
-    from . import paths
     from . import models as model_artifacts
+    from . import paths
 else:
     import models as model_artifacts
     import paths
