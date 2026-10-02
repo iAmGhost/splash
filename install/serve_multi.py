@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Multi-model supervisor for Splash.
 
-Manages a pool of single-model ``server/server.py`` processes, forwarding
+Manages a pool of single-model ``splash serve`` engine processes, forwarding
 requests to the engine serving the requested model and restarting the engine
 transparently when a request targets a different model.  A switch never
 cuts a request in the flight: before stopping the running engine the
@@ -30,7 +30,6 @@ make the supervisor cycle the engine.
 from __future__ import annotations
 
 import argparse
-import fcntl
 import functools
 import http.client
 import json
@@ -47,15 +46,13 @@ from http import server as http_server
 from pathlib import Path
 
 if __package__:
-    from . import assembly, paths
+    from . import paths
     from . import models as model_artifacts
 else:
-    import assembly
     import models as model_artifacts
     import paths
 
 ROOT = paths.ROOT
-RUNTIME_DIR = paths.RUNTIME
 
 # The authority/credential checks shared with the single-model server live in
 # the server package next to install/; make the repo root importable.
@@ -70,53 +67,6 @@ from server.http_security import (
 
 # Sentinel for detecting unpassed keyword arguments.
 _marker = object()
-
-
-def _ensure_installed(model: str) -> None:
-    """Install the model if it is not already present."""
-    selection = model_artifacts.Selection.of(paths.MODELS, model)
-    if model_artifacts.installation_kind(selection.link) is not None:
-        return
-    if not paths.PACKAGED:
-        with (RUNTIME_DIR / "build.lock").open("a+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            for command in (
-                ["make", "platform-check", "install-environment"],
-                ["make", "-j4", "all"],
-            ):
-                if subprocess.run(
-                    command, cwd=ROOT, pass_fds=(lock.fileno(),), check=False
-                ).returncode:
-                    raise RuntimeError("source build failed; see the output above")
-    check = subprocess.run(
-        [str(paths.BINARY), "device-check"], capture_output=True, text=True, check=False
-    )
-    if check.returncode:
-        report = check.stderr.strip()
-        raise RuntimeError(
-            report.splitlines()[-1].removeprefix("error: ")
-            if check.returncode > 0 and report
-            else f"the engine's device check failed: {report or f'status {check.returncode}'}"
-        )
-    command = [
-        str(paths.PYTHON),
-        str(ROOT / "install/models.py"),
-        "--models",
-        str(selection.models_root),
-        "--model",
-        selection.model,
-        "prepare",
-    ]
-    for flag, value in (
-        ("--revision", selection.revision),
-        ("--draft-model", selection.draft_model),
-    ):
-        if value is not None:
-            command[-1:-1] = [flag, value]
-    if selection.language_only:
-        command.insert(-1, "--language-only")
-    if subprocess.run(command, cwd=ROOT, check=False).returncode:
-        raise RuntimeError("model download or verification failed")
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +198,7 @@ def load_config(path: str | Path) -> list[dict]:
 
 
 class Supervisor:
-    """Manages one ``server/server.py`` process per model in a pool.
+    """Manages one ``splash serve`` engine process per model in a pool.
 
     Only one child process runs at a time; the ``ServerForwarder`` routes
     incoming requests to it and triggers a restart whenever a request names
@@ -652,20 +602,18 @@ class Supervisor:
     # -- child process ------------------------------------------------------
 
     def _child_command(self, model: str, spec: dict, port: int) -> list[str]:
-        selection = model_artifacts.Selection.of(paths.MODELS, model)
-        root, _ = assembly.hold(selection.link, paths.MODELS)
+        # The engine is the serve command itself: it does its own install
+        # (build lock, device check, model prepare), takes the serve locks
+        # and the assembly hold, and execs the server.  serve-multi only
+        # picks the model, the internal loopback port, and the per-model
+        # flags.
         command = [
             str(paths.PYTHON),
             "-u",
-            str(ROOT / "server" / "server.py"),
-            str(root / "target"),
-            str(root / "draft"),
-            "--tokenizer",
-            str(root / "tokenizer"),
+            str(ROOT / "install" / "launcher.py"),
+            "serve",
             "--model",
             model,
-            "--binary",
-            str(paths.BINARY),
             "--host",
             "127.0.0.1",
             "--port",
@@ -684,9 +632,10 @@ class Supervisor:
         return command
 
     def _child_environment(self) -> dict:
-        environment = dict(
-            os.environ, PYTHONUNBUFFERED="1", TRANSFORMERS_VERBOSITY="error"
-        )
+        # The serve child sets its own run flags; the key travels through
+        # the SPLASH_API_KEY environment variable it reads, not the command
+        # line.
+        environment = dict(os.environ)
         if self.shared.get("api_key") is not None:
             environment["SPLASH_API_KEY"] = self.shared["api_key"]
         return environment
@@ -1023,7 +972,7 @@ _SKIP_RESPONSE_HEADERS = _HOP_BY_HOP_HEADERS | {"content-encoding", "content-lan
 
 class _ForwardingHTTPServer(http_server.ThreadingHTTPServer):
     """HTTP server that accepts connections and proxies them to the active
-    ``server/server.py`` instance."""
+    ``splash serve`` engine."""
 
     def __init__(self, *args, supervisor: Supervisor | None = None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1500,8 +1449,6 @@ def serve_multi(args) -> int:
     """
     passthrough = list(getattr(args, "client_args", None) or [])
     models = load_config(args.config)
-    for spec in models:
-        _ensure_installed(spec["model"])
     # Proxy bind settings come from the same serve flags the engines get.
     host = _flag_value(passthrough, "--host", "127.0.0.1")
     raw_port = _flag_value(passthrough, "--port", os.environ.get("SPLASH_PORT", "8000"))

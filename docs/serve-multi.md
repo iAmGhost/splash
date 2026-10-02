@@ -37,8 +37,9 @@ By default no engine runs until the first request arrives; that request's
 model (by repo ID or alias) is what loads first. A model with
 `"preload": true` loads as soon as serve-multi starts instead; when
 several models set it, the earliest one in the list wins and the later ones
-are ignored. Any config model that is not installed yet is downloaded and
-prepared before the proxy starts accepting traffic.
+are ignored. serve-multi does not install models itself; install them
+first (for example with `splash serve`). A model that is not installed
+fails to load when it is requested, like any other load failure.
 
 ### Config file
 

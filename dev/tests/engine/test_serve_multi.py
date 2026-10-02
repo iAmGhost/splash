@@ -1814,31 +1814,50 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(spec["max_context"], 8192)
 
     def _child_command(self, supervisor, spec, model="owner/repo"):
-        with (
-            mock.patch.object(serve_multi.model_artifacts, "Selection") as sel,
-            mock.patch.object(
-                serve_multi.assembly, "hold", return_value=(mock.MagicMock(), None)
-            ),
-        ):
-            sel.of.return_value = mock.Mock(link="link")
-            return [str(part) for part in supervisor._child_command(model, spec, 12345)]
+        return [str(part) for part in supervisor._child_command(model, spec, 12345)]
+
+    def test_child_command_is_the_serve_command(self):
+        """The engine is the serve command itself, bound to an internal
+        loopback port; install, locks and the assembly hold are the serve
+        command's own job."""
+        spec = {
+            "model": "owner/repo",
+            "aliases": ("alias",),
+            "max_context": 8192,
+            "arguments": [],
+        }
+        supervisor = serve_multi.Supervisor([spec], {}, "127.0.0.1", 0)
+        command = self._child_command(supervisor, spec)
+        joined = " ".join(command)
+        self.assertIn(f"{serve_multi.paths.PYTHON}", command)
+        self.assertIn(f"{serve_multi.ROOT / 'install' / 'launcher.py'}", command)
+        self.assertIn("serve", command)
+        self.assertNotIn("server.py", joined)
+        # internal loopback binding, not the user-facing proxy port
+        self.assertEqual(command[command.index("--host") + 1], "127.0.0.1")
+        self.assertEqual(command[command.index("--port") + 1], "12345")
+        self.assertIn("--served-model-name=alias", command)
+        # legacy 'max_context' key becomes a serve flag
+        self.assertEqual(command[command.index("--max-context") + 1], "8192")
 
     def test_child_command_max_context_precedence(self):
-        """--max-context (shared) beats the per-model config value, which
-        beats the engine default (auto)."""
+        """--max-context given after '--' beats the per-model config value,
+        which beats the serve default (auto)."""
         spec = {"model": "owner/repo", "aliases": (), "max_context": 8192}
         # shared flag wins over the config value
         supervisor = serve_multi.Supervisor(
-            [spec], {"max_context": 131072}, "127.0.0.1", 0
+            [spec], {"passthrough": ["--max-context", "131072"]}, "127.0.0.1", 0
         )
-        self.assertIn("131072", self._child_command(supervisor, spec))
+        command = self._child_command(supervisor, spec)
+        self.assertEqual(command[command.index("--max-context") + 1], "131072")
         # config value used when the shared flag is not given
         supervisor = serve_multi.Supervisor([spec], {}, "127.0.0.1", 0)
-        self.assertIn("8192", self._child_command(supervisor, spec))
-        # auto when neither is set
+        command = self._child_command(supervisor, spec)
+        self.assertEqual(command[command.index("--max-context") + 1], "8192")
+        # no flag at all when neither is set; serve picks its default
         spec = {"model": "owner/repo", "aliases": (), "max_context": None}
         supervisor = serve_multi.Supervisor([spec], {}, "127.0.0.1", 0)
-        self.assertIn("auto", self._child_command(supervisor, spec))
+        self.assertNotIn("--max-context", self._child_command(supervisor, spec))
 
     def test_switch_to_via_alias(self):
         """switch_to should accept an alias and resolve it to the full model ID."""
@@ -1933,7 +1952,6 @@ class ServeMultiEntryTests(unittest.TestCase):
             path = f.name
         try:
             with (
-                mock.patch.object(serve_multi, "_ensure_installed"),
                 mock.patch.object(serve_multi, "Supervisor") as supervisor_cls,
                 mock.patch.object(serve_multi, "_ForwardingHTTPServer") as server_cls,
                 mock.patch("signal.signal"),
