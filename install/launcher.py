@@ -18,14 +18,12 @@ import urllib.request
 try:
     from . import assembly, catalog, clients, paths
     from . import models as model_artifacts
-    from . import serve_multi as _serve_multi
 except ImportError:  # Executed directly by the source or packaged entry point.
     import assembly
     import catalog
     import clients
     import models as model_artifacts
     import paths
-    import serve_multi as _serve_multi
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
@@ -638,91 +636,6 @@ def parse_args(argv=None):
         type=_parse_max_image_pixels,
         help="maximum resized pixels per image, 65536–4194304 (default: 4194304)",
     )
-    # serve-multi subparser (placed right after 'serve' so help output groups them)
-    serve_multi_parser = commands.add_parser(
-        "serve-multi",
-        help="serve multiple models; restart the engine when a request names another",
-        description="Load a JSON config of models, serve them on a single port, and "
-        "switch the native engine transparently when a request targets a "
-        "different model.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Examples:\n"
-            "  splash serve-multi --config models.json\n"
-            "  splash serve-multi --config models.json --port 8001\n\n"
-            "models.json shape:\n"
-            '  {"models": [{"model": "OWNER/REPO", "aliases": ["alias"],'
-            ' "max_context": 131072}, ...]}\n'
-            "Shared flags (same as 'splash serve --help') are passed through "
-            "to every engine instance and take precedence over the "
-            "per-model config values (e.g. --max-context beats "
-            "'max_context')."
-        ),
-    )
-    # Share the same host/port/default-reasoning-effort/kv-format/max-memory/
-    # max-cache-disk/max-context/allowed-host/max-request-size/max-image-pixels/
-    # api-key/no-webui arguments with 'serve' so the user sees a consistent
-    # interface across both subcommands.
-    for dest, kwargs in (
-        ("host", {"default": "127.0.0.1"}),
-        (
-            "port",
-            {"type": _parse_port, "default": os.environ.get("SPLASH_PORT", str(PORT))},
-        ),
-        ("default_reasoning_effort", {"choices": REASONING_EFFORTS, "default": None}),
-        ("kv_format", {"choices": ("int8", "bf16"), "default": "int8"}),
-        ("max_memory", {"type": _parse_max_memory, "default": None}),
-        ("max_cache_disk", {"type": _parse_max_cache_disk, "default": 0}),
-        ("max_context", {"type": _parse_max_context, "default": None}),
-        ("allowed_host", {"action": "append", "default": [], "metavar": "HOST"}),
-        ("max_request_size", {"type": _parse_request_size, "default": None}),
-        ("max_image_pixels", {"type": _parse_max_image_pixels, "default": None}),
-        ("api_key", {"default": os.environ.get("SPLASH_API_KEY")}),
-        ("no_webui", {"action": "store_true"}),
-    ):
-        serve_multi_parser.add_argument(
-            f"--{dest.replace('_', '-')}", dest=dest, **kwargs
-        )
-    serve_multi_parser.add_argument(
-        "--config",
-        required=True,
-        metavar="FILE",
-        help="JSON file listing the models to serve; see epilog for shape",
-    )
-    serve_multi_parser.add_argument(
-        "--switch-timeout",
-        type=float,
-        default=600.0,
-        metavar="SECONDS",
-        help=(
-            "seconds a request waits while its model loads; "
-            "503 is returned after this budget is exhausted (default 600)"
-        ),
-    )
-    serve_multi_parser.add_argument(
-        "--switch-settle",
-        type=float,
-        default=60.0,
-        metavar="SECONDS",
-        help=(
-            "after stopping the current engine, wait up to this many seconds "
-            "for its memory to be reclaimed before launching the next one; "
-            "the wait ends early once the target is reached or memory is "
-            "truly flat (default 60)"
-        ),
-    )
-    serve_multi_parser.add_argument(
-        "--evict-cache",
-        action="store_true",
-        default=True,
-        help="nudge macOS to reclaim the stopped engine's file cache before launching the next model (default: on)",
-    )
-    serve_multi_parser.add_argument(
-        "--no-evict-cache",
-        dest="evict_cache",
-        action="store_false",
-        help="skip the stale-cache pressure pass; faster switches but higher risk of 'Q4 buffer below plan' failures",
-    )
     server.add_argument(
         "--request-timeout",
         dest="request_timeout",
@@ -770,11 +683,7 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     try:
-        if args.command == "serve":
-            return serve(args)
-        if args.command == "serve-multi":
-            return _serve_multi.serve_multi(args)
-        return coding_client(args)
+        return serve(args) if args.command == "serve" else coding_client(args)
     except (LauncherError, clients.ClientError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
