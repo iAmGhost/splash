@@ -3,13 +3,21 @@
 
 Manages a pool of single-model ``server/server.py`` processes, forwarding
 requests to the engine serving the requested model and restarting the engine
-transparently when a request targets a different model.  In-flight requests
-are held (up to a short budget) during the switch; requests that arrive while
-a switch is already in flight and name yet another model are queued and held
-until their model is loaded (in arrival order).  Requests that cannot be
-served within the hold budget get a 503 with a ``Retry-After`` header so
-that standard OpenAI/Anthropic SDKs retry them without any application
-changes.
+transparently when a request targets a different model.  A switch never
+cuts a request in the flight: before stopping the running engine the
+supervisor waits for requests already being forwarded to it to complete,
+and requests that arrive while a switch is pending (for any configured
+model, including the one still active) are queued and held until their
+model is loaded (in arrival order).  A switch does not start until the
+model it would stop has neither waiting nor in-flight requests, so an
+older request (for example the one that triggered the initial load) is
+always processed before a switch requested while it was waiting.  If
+loading a model fails, the supervisor restores the previous model, answers
+the requests holding for the failed model with a 503
+``model_load_failed`` right away, and drops the model from the queue.
+Requests that cannot be served within the hold budget get a 503 with a
+``Retry-After`` header so that standard OpenAI/Anthropic SDKs retry them
+without any application changes.
 
 Before anything is proxied, every request is validated the same way the
 single-model server validates it: the Host (and any Origin) header must name
@@ -363,7 +371,14 @@ class Supervisor:
 
     Only one child process runs at a time; the ``ServerForwarder`` routes
     incoming requests to it and triggers a restart whenever a request names
-    a different model than the one currently loaded.
+    a different model than the one currently loaded.  Every engine
+    lifecycle change — a model switch, a crash restart, a failed-switch
+    restore — is claimed before the old engine is touched: the claim waits
+    for requests already in flight on the current engine to complete
+    (``_wait_for_in_flight``) and, while held, makes requests for any other
+    model queue behind it (``_queued_targets``) and requests for the current
+    model hold until it is ready again.  Nothing is ever cut in the flight,
+    and engines are never (re)launched out of request order.
     """
 
     def __init__(
@@ -404,6 +419,12 @@ class Supervisor:
         # Serializes whole stop/settle/launch lifecycles so the switch,
         # reaper, and watcher threads can never launch engines in parallel.
         self._op_lock = threading.RLock()
+        # Requests currently being forwarded to the running engine.  A
+        # pending switch refuses new forwards (``begin_forward``) and waits
+        # for this count to reach zero (``_wait_for_in_flight``) before
+        # stopping the engine, so it never cuts a request in the flight.
+        self._in_flight = 0
+        self._in_flight_cv = threading.Condition(self._lock)
         self._child: subprocess.Popen | None = None
         self._child_port: int | None = None
         self._child_ready = False
@@ -414,6 +435,19 @@ class Supervisor:
         # Models requested while a switch is in flight, in arrival order;
         # _drain_queue starts them one at a time as each switch finishes.
         self._queued_targets: list[str] = []
+        # Models whose most recent switch failed to load.  Requests holding
+        # for one of these get a 503 model_load_failed right away instead of
+        # waiting out the hold budget, and the model is dropped from the
+        # queue so it is not retried automatically.  A new switch to the
+        # model clears the flag (client-driven retry).
+        self._failed_switches: set[str] = set()
+        # Requests currently held (waiting) for each canonical model to
+        # become active.  A switch to the next queued model does not start
+        # until the model it would stop has neither waiting nor in-flight
+        # requests, so an older request is never starved by a newer model's
+        # switch (e.g. the first request that triggered the initial load is
+        # always processed before a switch requested while it waited).
+        self._waiting: dict[str, int] = {}
         self._crash_times: list[float] = []
         self._crash_loop = False  # 3 crashes in 60s; auto-restart parked
         self._last_failed_child: subprocess.Popen | None = None
@@ -453,19 +487,168 @@ class Supervisor:
     @property
     def switch_target(self) -> str | None:
         with self._lock:
-            return self._switch_target
+            # A crash restart has no switch target; report the model it is
+            # (re)loading so /status and errors can name it.
+            return self._switch_target or self._relaunching
 
     @property
     def queued_models(self) -> list[str]:
         with self._lock:
             return list(self._queued_targets)
 
+    @property
+    def in_flight(self) -> int:
+        """Requests currently being forwarded to the running engine."""
+        with self._lock:
+            return self._in_flight
+
+    def switch_failed(self, model: str) -> bool:
+        """True if the most recent switch to *model* (or an alias) failed to
+        load and has not since been retried — a new switch to the model
+        clears the flag."""
+        canonical = self._resolve_model(model)
+        with self._lock:
+            return canonical in self._failed_switches
+
+    def begin_forward(self, held_model: str | None = None) -> int | None:
+        """Register a request about to be forwarded to the running engine.
+
+        Returns the engine's port, or ``None`` when the request must not
+        reach the engine: either no engine is up or a switch is pending.
+        The check and the counter increment are one critical section, so
+        the drain (``_wait_for_in_flight``) can never miss a forward — a
+        forward either counts against the drain or is refused.
+
+        If *held_model* is given, the request is finishing a hold for that
+        model: its wait count is swapped for a forward count in the same
+        critical section, so a switch cannot slip in between the hold
+        ending and the forward starting.
+        """
+        with self._lock:
+            if self._stop.is_set() or self._switching:
+                return None
+            if self._child_port is None:
+                return None
+            if held_model is not None:
+                self._decrement_waiting(self._resolve_model(held_model))
+            self._in_flight += 1
+            self._in_flight_cv.notify_all()
+            return self._child_port
+
+    def end_forward(self) -> None:
+        """Release a forward registered with :meth:`begin_forward`."""
+        with self._lock:
+            self._in_flight = max(0, self._in_flight - 1)
+            self._in_flight_cv.notify_all()
+
+    def begin_hold(self, model: str) -> None:
+        """Track a request that is now waiting (held) for *model* (or an
+        alias) to become active.  Released by :meth:`end_hold`, or by the
+        hold→forward handoff in :meth:`begin_forward` when the model is
+        ready."""
+        canonical = self._resolve_model(model)
+        with self._lock:
+            self._waiting[canonical] = self._waiting.get(canonical, 0) + 1
+            self._in_flight_cv.notify_all()
+
+    def end_hold(self, model: str) -> None:
+        """Release :meth:`begin_hold` for a held request that ends without
+        forwarding (timed out, its model's load failed, or an error)."""
+        with self._lock:
+            self._decrement_waiting(self._resolve_model(model))
+
+    def _decrement_waiting(self, canonical: str) -> None:
+        """Drop one waiting count; caller holds the lock."""
+        count = self._waiting.get(canonical, 0) - 1
+        if count <= 0:
+            self._waiting.pop(canonical, None)
+        else:
+            self._waiting[canonical] = count
+        self._in_flight_cv.notify_all()
+
+    def waiting_counts(self) -> dict[str, int]:
+        """Requests currently held per canonical model (for /status)."""
+        with self._lock:
+            return dict(self._waiting)
+
+    def _wait_for_model_free(self, model: str) -> None:
+        """Block until no request is waiting for *model* or being forwarded
+        to the running engine.  Called before the engine is stopped for the
+        next queued model, so every request older than that switch is
+        processed first."""
+        with self._in_flight_cv:
+            self._in_flight_cv.wait_for(
+                lambda: self._in_flight == 0
+                and self._waiting.get(model, 0) == 0
+            )
+
+    def _wait_for_in_flight(self) -> None:
+        """Block until no request is being forwarded to the running engine.
+
+        Called (holding ``_op_lock``) before a switch stops the engine, so
+        a request already in the flight always runs to completion instead
+        of being cut by the engine restart.  New forwards are refused while
+        a switch is pending, so the count can only go down here.  Bounded
+        by the proxy's own upstream socket timeout, not by the client.
+        """
+        with self._in_flight_cv:
+            count = self._in_flight
+            if count == 0 or self._stop.is_set():
+                return
+            print(
+                f"serve-multi · waiting for {count} in-flight request(s) "
+                "to complete before switching",
+                flush=True,
+            )
+            waited = 0.0
+            while self._in_flight > 0 and not self._stop.is_set():
+                self._in_flight_cv.wait(5.0)
+                waited += 5.0
+                if self._in_flight > 0 and not self._stop.is_set():
+                    print(
+                        f"serve-multi · still waiting for {self._in_flight} "
+                        f"in-flight request(s) ({waited:.0f}s)",
+                        flush=True,
+                    )
+
+    def _claim_restart(self, model: str) -> bool:
+        """Claim the engine lifecycle for a crash restart.
+
+        Sets the switching state *before* the caller takes ``_op_lock`` so
+        that for the whole restart — including the time spent queued for
+        the lifecycle lock — a request for another model is queued behind
+        the restart (``switch_to``) instead of killing the model that is
+        (re)loading, and new forwards are refused (``begin_forward``) while
+        the engine is down, so a request for this model is held until it is
+        ready again instead of hitting a dead port.  Returns False when a
+        switch already owns the lifecycle; that switch relaunches its own
+        model and the crashed model comes back on its next request.
+        """
+        with self._lock:
+            if self._stop.is_set() or self._switching:
+                return False
+            self._switching = True
+            self._relaunching = model
+        return True
+
+    def _release_restart(self) -> None:
+        """Release a restart claimed with :meth:`_claim_restart` and start
+        the next queued switch, if any — its requests are served in arrival
+        order, after the restarted model is ready."""
+        with self._lock:
+            self._switching = False
+            self._relaunching = None
+            self._switch_done.set()
+        self._drain_queue()
+
     def switch_to(self, model: str) -> None:
         """Request a switch to *model*.  Non-blocking; the switch runs in
-        a background thread.  If a switch is already in flight, a model that
-        differs from the in-flight target is queued and started as soon as
-        the current switch finishes (``_drain_queue``), so requests holding
-        for it are served in arrival order instead of being dropped."""
+        a background thread that first waits for requests already in flight
+        on the current engine to complete before stopping it.  If a switch
+        is already in flight, a model that differs from the in-flight
+        target is queued and started as soon as the current switch finishes
+        (``_drain_queue``), so requests holding for it are served in
+        arrival order instead of being dropped."""
         canonical = self._resolve_model(model)
         with self._lock:
             if self._active_model == canonical:
@@ -478,13 +661,14 @@ class Supervisor:
                     self._queued_targets.append(canonical)
                     print(
                         f"serve-multi · queued switch to {model} "
-                        f"(after {self._switch_target})",
+                        f"(after {self._switch_target or self._relaunching})",
                         flush=True,
                     )
                 return
             self._switching = True
             self._switch_target = canonical
             self._switch_done.clear()
+            self._failed_switches.discard(canonical)
         threading.Thread(
             target=self._do_switch,
             args=(model,),
@@ -496,7 +680,20 @@ class Supervisor:
         """Start the next queued switch, if any, after the current switch or
         load attempt has finished.  Called at the end of every switch/load
         attempt (success or failure) so requests held for a later model are
-        served in arrival order."""
+        served in arrival order.
+
+        Before starting, waits for the model that is now active to be free
+        of waiting and in-flight requests — otherwise the switch would
+        starve requests that arrived before the queued one (for example the
+        first request that triggered the initial load, still waiting for
+        its model when a second request queued a switch during the load).
+        """
+        with self._lock:
+            if self._stop.is_set() or self._switching or not self._queued_targets:
+                return
+        active = self.active_model
+        if active is not None:
+            self._wait_for_model_free(active)
         with self._lock:
             if self._stop.is_set() or self._switching:
                 return
@@ -511,6 +708,7 @@ class Supervisor:
             self._switching = True
             self._switch_target = model
             self._switch_done.clear()
+            self._failed_switches.discard(model)
         print(f"serve-multi · starting queued switch to {model}", flush=True)
         threading.Thread(
             target=self._do_switch,
@@ -532,6 +730,7 @@ class Supervisor:
             self._switching = True
             self._switch_target = first
             self._switch_done.clear()
+            self._failed_switches.discard(first)
         print(f"serve-multi · loading first model: {first}", flush=True)
         threading.Thread(
             target=self._do_load_first,
@@ -545,6 +744,7 @@ class Supervisor:
         """Load the first model from the config.  Runs in a background thread."""
         try:
             with self._op_lock:
+                self._wait_for_in_flight()
                 self._stop_child()
                 self._settle_memory(_model_memory_need(model))
                 self._launch_child(model, wait_ready=True)
@@ -561,13 +761,13 @@ class Supervisor:
                 self._switching = False
                 self._switch_target = None
                 self._switch_done.set()
+                self._failed_switches.add(model)
             self._drain_queue()
             print(
                 f"serve-multi · first-model load failed: {error}",
                 file=sys.stderr,
                 flush=True,
             )
-            # Don't park the supervisor permanently; the reaper will retry.
 
     def shutdown(self) -> None:
         self._stop.set()
@@ -974,18 +1174,28 @@ class Supervisor:
                     return  # already replaced
             if child.poll() == 0:
                 return  # clean exit (shouldn't normally happen)
-            # Unexpected crash — restart after settling.  Serialized on
-            # _op_lock and re-checked under it: a switch may have taken over
-            # while we were waiting for the lock.
+            # Unexpected crash — restart after settling.  The restart claims
+            # the lifecycle (like a switch) before taking _op_lock, so
+            # requests queue behind the (re)load instead of killing it; it
+            # is re-checked under the lock in case a racing restart already
+            # revived the engine.
             if tail := self._output_tail(child):
                 print(tail, flush=True)
             try:
-                with self._op_lock:
-                    with self._lock:
-                        if self._child is not child or self._switching:
-                            return  # superseded or a switch owns the lifecycle
-                    self._settle_memory(_model_memory_need(model))
-                    self._launch_child(model, wait_ready=True)
+                if not self._claim_restart(model):
+                    return  # a switch owns the lifecycle; it relaunches
+                try:
+                    with self._op_lock:
+                        with self._lock:
+                            if (
+                                self._child is not None
+                                and self._child.poll() is None
+                            ):
+                                return  # someone already revived the engine
+                        self._settle_memory(_model_memory_need(model))
+                        self._launch_child(model, wait_ready=True)
+                finally:
+                    self._release_restart()
             except (RuntimeError, OSError) as error:
                 print(
                     f"serve-multi · restart of {model} failed: {error}",
@@ -1014,9 +1224,8 @@ class Supervisor:
         with self._lock:
             child = self._child
             model = self._active_model
-            switching = self._switching
-            if model is None or switching:
-                return  # a switch owns the lifecycle; it will (re)launch
+            if model is None or self._switching:
+                return  # a switch/restart owns the lifecycle
             if child is None or child.poll() is not None:
                 self._crash_times = [
                     t for t in self._crash_times if time.monotonic() - t < 60
@@ -1031,15 +1240,19 @@ class Supervisor:
                     flush=True,
                 )
         try:
-            with self._op_lock:
-                # Re-check under the lifecycle lock: a switch may have
-                # started (and already relaunched) while we queued.
-                with self._lock:
-                    child = self._child
-                    if self._switching or (child is not None and child.poll() is None):
-                        return
-                self._settle_memory(_model_memory_need(model))
-                self._launch_child(model, wait_ready=True)
+            if not self._claim_restart(model):
+                return  # a switch owns the lifecycle; it will (re)launch
+            try:
+                with self._op_lock:
+                    # Re-check under the lifecycle lock: a racing restart
+                    # may have revived the engine while we queued.
+                    with self._lock:
+                        if self._child is not None and self._child.poll() is None:
+                            return
+                    self._settle_memory(_model_memory_need(model))
+                    self._launch_child(model, wait_ready=True)
+            finally:
+                self._release_restart()
         except (RuntimeError, OSError) as error:
             print(
                 f"serve-multi · (re)launch of {model} failed: {error}; will retry",
@@ -1053,6 +1266,7 @@ class Supervisor:
             if canonical not in self._model_names():
                 raise ValueError(f"unknown model: {model}")
             with self._op_lock:
+                self._wait_for_in_flight()
                 self._stop_child()
                 self._settle_memory(_model_memory_need(canonical))
                 self._launch_child(canonical, wait_ready=True)
@@ -1067,10 +1281,11 @@ class Supervisor:
         except Exception as error:
             # Try to restore the previous model before giving up (unless the
             # request was rejected before the current engine was touched).
+            # The switching state is kept for the whole restore — new
+            # requests queue behind it and forwards are refused, instead of
+            # racing the relaunch — and is released only once the restore is
+            # done, after which the next queued switch starts.
             with self._lock:
-                self._switching = False
-                self._switch_target = None
-                self._switch_done.set()
                 previous = self._active_model
             restore = (
                 not isinstance(error, ValueError) and previous and previous != model
@@ -1099,6 +1314,18 @@ class Supervisor:
                     file=sys.stderr,
                     flush=True,
                 )
+            with self._lock:
+                self._switching = False
+                self._switch_target = None
+                self._switch_done.set()
+                self._failed_switches.add(canonical)
+                # Do not retry a model that just failed to load: drop it
+                # from the queue so the supervisor moves on to the next
+                # queued model, and let held requests for it fail fast
+                # (switch_failed) instead of waiting out the hold budget.
+                self._queued_targets = [
+                    m for m in self._queued_targets if m != canonical
+                ]
             self._drain_queue()
 
     def _resolve_model(self, model: str) -> str:
@@ -1224,6 +1451,8 @@ class _ServeMultiHandler(http_server.BaseHTTPRequestHandler):
                         "active_model": self.supervisor.active_model,
                         "switch_target": self.supervisor.switch_target,
                         "queued_models": self.supervisor.queued_models,
+                        "in_flight": self.supervisor.in_flight,
+                        "waiting": self.supervisor.waiting_counts(),
                     },
                 )
                 return
@@ -1286,13 +1515,15 @@ class _ServeMultiHandler(http_server.BaseHTTPRequestHandler):
         if not isinstance(req_model, str) or not req_model:
             return None
         active = self.supervisor.active_model
-        if active and req_model == active:
-            return None  # already serving this model
-        # Also check aliases.
-        if active:
-            active_aliases = self._active_aliases()
-            if req_model in active_aliases:
-                return None
+        serving = bool(active) and (
+            req_model == active or req_model in self._active_aliases()
+        )
+        # The active model is about to be replaced when a switch is pending,
+        # so a matching request joins the queue like any other (held until
+        # its model is the one being served again) instead of racing the
+        # engine that is about to stop.
+        if serving and not self.supervisor.switching:
+            return None  # already serving this model, nothing in flight
         if req_model not in self.supervisor._model_names():
             # Not a model this deployment serves; a switch would just fail
             # after cycling the engine, so answer immediately.
@@ -1303,56 +1534,101 @@ class _ServeMultiHandler(http_server.BaseHTTPRequestHandler):
                 code="model_not_found",
             )
             return 503
-        # Model mismatch — start a switch, or queue behind the one already in
-        # flight, then hold the connection until this model is served.
+        # Model mismatch (or the active model is being switched away) —
+        # start a switch, or queue behind the one already in flight, then
+        # hold the connection until this model is served.
         self.supervisor.switch_to(req_model)
         return self._hold_until_switched(body, req_model)
 
     def _hold_until_switched(self, body: bytes, req_model: str) -> int:
         """Hold the connection (silently) until *req_model* is the active
         model, then forward the request.  Returns 503 if that does not
-        happen within the hold budget (including queued switches)."""
+        happen within the hold budget (including queued switches).
+
+        The request is tracked as *waiting for* its model from here until
+        it is forwarded (atomically), so the supervisor will not start a
+        later switch before this request has been processed — a queued
+        model switch never starves an older request.
+        """
         # Hold the connection silently until the switch completes.  Nothing
         # may be written before the status line, so no keep-alive pings are
         # sent here; a client that gives up early simply retries and finds
         # the new model ready.  (Writing SSE pings before send_response()
         # would put "body" bytes ahead of the HTTP status line and corrupt
         # the response.)
-        switch_timeout = self.supervisor.hold_timeout
-        deadline = time.monotonic() + switch_timeout
+        self.supervisor.begin_hold(req_model)
+        handed_off = False
+        try:
+            switch_timeout = self.supervisor.hold_timeout
+            deadline = time.monotonic() + switch_timeout
 
-        while time.monotonic() < deadline:
-            if not self.supervisor.switching and self.supervisor.child_ready:
-                active = self.supervisor.active_model
-                if active and (
-                    req_model == active or req_model in self._active_aliases()
-                ):
-                    break  # this request's model is the one being served
-            time.sleep(0.1)
+            while time.monotonic() < deadline:
+                if self.supervisor.switch_failed(req_model):
+                    break  # the switch to this model failed; stop holding
+                if not self.supervisor.switching and self.supervisor.child_ready:
+                    active = self.supervisor.active_model
+                    if active and (
+                        req_model == active
+                        or req_model in self._active_aliases()
+                    ):
+                        break  # this request's model is the one being served
+                time.sleep(0.1)
 
-        # If the model never became active in time, return 503.
-        active = self.supervisor.active_model
-        if (
-            self.supervisor.switching
-            or not self.supervisor.child_ready
-            or not active
-            or (req_model != active and req_model not in self._active_aliases())
-        ):
-            target = self.supervisor.switch_target
+            # The switch to this model failed to load — answer now instead
+            # of holding out the budget; the previous model was restored.
+            if self.supervisor.switch_failed(req_model):
+                self.supervisor.end_hold(req_model)
+                self._send_error(
+                    503,
+                    f"loading model {req_model} failed; see the server log",
+                    "server_error",
+                    code="model_load_failed",
+                    retry_after="2",
+                )
+                return 503
+
+            # If the model never became active in time, return 503.
+            active = self.supervisor.active_model
+            if (
+                self.supervisor.switching
+                or not self.supervisor.child_ready
+                or not active
+                or (
+                    req_model != active
+                    and req_model not in self._active_aliases()
+                )
+            ):
+                self.supervisor.end_hold(req_model)
+                target = self.supervisor.switch_target
+                self._send_error(
+                    503,
+                    f"model {req_model} was not ready within "
+                    f"{switch_timeout:.0f}s"
+                    + (f" (switching to {target})" if target else ""),
+                    "model_switching",
+                    code="model_switching",
+                    retry_after="2",
+                )
+                return 503
+
+            # Switch complete — forward the original request, handing the
+            # wait count over to the forward atomically.
+            handed_off = True
+            self._forward("POST", self.path, body, held_model=req_model)
+            return 200
+        except Exception as error:
+            if not handed_off:
+                self.supervisor.end_hold(req_model)
+            print(
+                f"serve-multi · unexpected error while holding a request: "
+                f"{error}",
+                file=sys.stderr,
+                flush=True,
+            )
             self._send_error(
-                503,
-                f"model {req_model} was not ready within "
-                f"{switch_timeout:.0f}s"
-                + (f" (switching to {target})" if target else ""),
-                "model_switching",
-                code="model_switching",
-                retry_after="2",
+                503, "internal supervisor error", "server_error"
             )
             return 503
-
-        # Switch complete — forward the original request.
-        self._forward("POST", self.path, body)
-        return 200
 
     def _active_aliases(self) -> frozenset[str]:
         active = self.supervisor.active_model
@@ -1444,23 +1720,48 @@ class _ServeMultiHandler(http_server.BaseHTTPRequestHandler):
             self.wfile.write(resp_body)
             self.wfile.flush()
 
-    def _forward(self, method: str, path: str, body: bytes | None) -> None:
-        port = self.supervisor.child_port
+    def _forward(
+        self,
+        method: str,
+        path: str,
+        body: bytes | None,
+        held_model: str | None = None,
+    ) -> None:
+        port = self.supervisor.begin_forward(held_model)
         if port is None:
-            self._send_error(503, "no engine running", "server_error")
+            if held_model is not None:
+                # The hold→forward handoff was refused (a switch got in
+                # first): the request's wait count must still be released.
+                self.supervisor.end_hold(held_model)
+            if self.supervisor.switching:
+                # A switch is pending and this request may not join the
+                # engine it is about to stop; standard SDKs retry on the
+                # Retry-After hint.
+                self._send_error(
+                    503,
+                    "model switch in progress; retry shortly",
+                    "model_switching",
+                    code="model_switching",
+                    retry_after="2",
+                )
+            else:
+                self._send_error(503, "no engine running", "server_error")
             return
         try:
-            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
-            conn.request(method, path, body, self._forward_headers(port))
             try:
-                self._write_upstream_response(conn.getresponse())
-            except (OSError, BrokenPipeError):
-                # Client disconnected during forwarding; nothing we can do.
-                pass
-            finally:
-                conn.close()
-        except (OSError, http.client.HTTPException) as error:
-            self._send_error(502, f"upstream error: {error}", "upstream_error")
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+                conn.request(method, path, body, self._forward_headers(port))
+                try:
+                    self._write_upstream_response(conn.getresponse())
+                except (OSError, BrokenPipeError):
+                    # Client disconnected during forwarding; nothing we can do.
+                    pass
+                finally:
+                    conn.close()
+            except (OSError, http.client.HTTPException) as error:
+                self._send_error(502, f"upstream error: {error}", "upstream_error")
+        finally:
+            self.supervisor.end_forward()
 
     # -- response helpers ---------------------------------------------------
 

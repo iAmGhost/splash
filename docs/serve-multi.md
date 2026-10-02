@@ -4,10 +4,11 @@
 
 `splash serve-multi` serves several models from one port. It runs a thin
 proxy that owns the port you pass; exactly one native engine runs at a
-time. When a request names a model that is not loaded, the proxy stops the
-current engine, waits for its memory to be reclaimed, loads the requested
-model, and then serves the request — no client-side reconnection or
-retries required.
+time. When a request names a model that is not loaded, the proxy waits for
+requests already in flight on the current engine to complete, stops the
+engine, waits for its memory to be reclaimed, loads the requested model,
+and then serves the request — no client-side reconnection or retries
+required, and no in-flight request is ever cut short.
 
 ## Usage
 
@@ -51,7 +52,20 @@ POSTs to `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, and
 `/v1/messages` are inspected for their `model` field (a repo ID or an alias);
 everything else is forwarded as-is:
 
+- **In-flight requests are never cut** — once a switch is triggered, the
+  supervisor waits for requests already being forwarded to the current
+  engine to run to completion before stopping it. A switch therefore starts
+  as soon as the current work is done, but never in the middle of it.
+- **Requests are processed in arrival order** — a switch to a queued model
+  does not start until every request that is waiting for, or being served
+  by, the model it would stop has been processed. In particular the first
+  request that triggers the initial load is always served before a switch
+  requested while that load was still running, so an early request is
+  never starved by a later model's switch.
 - **Matching model or alias** — forwarded to the running engine immediately.
+  If a switch is already pending (the current model is about to be
+  replaced), these requests are held and served once the model becomes the
+  active one again.
 - **Another configured model** — a switch is started and the connection is
   held until that model is the active one, then the original request is
   forwarded. If the model is not ready within `--switch-timeout`
@@ -65,7 +79,11 @@ everything else is forwarded as-is:
   `model_not_found`; the engine is not cycled.
 
 If loading the new model fails, the supervisor restores the previous model
-instead of staying down.
+instead of staying down; requests held for the failed model get a `503`
+with error code `model_load_failed` immediately (with `Retry-After`, so
+SDK clients retry it — the retry starts a fresh load attempt), and the
+model is removed from the queue so the supervisor moves on to the next
+queued model instead of retrying it automatically.
 
 ### Options
 
@@ -115,7 +133,7 @@ management. While a switch is in progress (or no engine is ready):
 | Endpoint | Behavior |
 | --- | --- |
 | `GET /ready` | `503` `{"status": "switching"}` |
-| `GET /status` | `503` with `active_model`, `switch_target`, and `queued_models` |
+| `GET /status` | `503` with `active_model`, `switch_target`, `queued_models`, and `in_flight` |
 | `GET /v1/models` | `503` with an empty model list |
 | `GET /metrics` | `503` |
 
@@ -127,5 +145,10 @@ When ready, all of these forward to the engine.
   supervisor's own lines are marked `serve-multi ·`.
 - An engine that exits unexpectedly is relaunched automatically; after three
   crashes within 60 seconds the supervisor parks and leaves a message
-  instead of thrashing.
+  instead of thrashing. A crash restart is queued exactly like a model
+  switch: requests that arrive while the engine is (re)loading are held or
+  queued in arrival order, and the in-progress load is never killed by a
+  request for another model.
+- If a model fails to load, the previous model is restored before any
+  queued switch runs, and requests hold for it until it is back.
 - `Ctrl+C` or `SIGTERM` stops the engine and the proxy cleanly.

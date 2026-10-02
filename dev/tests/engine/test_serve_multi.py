@@ -2,6 +2,7 @@ import http.client
 import io
 import json
 import socket
+import subprocess
 import tempfile
 import threading
 import time
@@ -725,6 +726,368 @@ class ProxyTests(unittest.TestCase):
             finally:
                 server.shutdown()
 
+    def test_switch_waits_for_in_flight_request(self):
+        """A model switch must not cut a request that is already being
+        forwarded to the current engine: the supervisor stops the engine
+        only after the in-flight request has completed, and the request
+        receives its full response."""
+
+        class SlowBackendHandler(FakeBackendHandler):
+            """Like the fake backend, but each POST takes a while."""
+
+            model_id = "owner/repo-a"
+
+            def do_POST(self):
+                time.sleep(0.6)
+                super().do_POST()
+
+        backend_port = _free_port()
+        server = ThreadingHTTPServer(("127.0.0.1", backend_port), SlowBackendHandler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        supervisor = self._make_supervisor(
+            [{"model": "owner/repo-a"}, {"model": "owner/repo-b"}], backend_port
+        )
+        stop_violations = []
+        stop_time = []
+
+        def fake_stop():
+            if supervisor.in_flight > 0:
+                stop_violations.append(supervisor.in_flight)
+            stop_time.append(time.monotonic())
+
+        def fake_launch(model, *, wait_ready=True):
+            with supervisor._lock:
+                supervisor._child_port = backend_port
+                supervisor._child_ready = True
+                supervisor._active_model = model
+
+        with (
+            mock.patch.object(supervisor, "_stop_child", side_effect=fake_stop),
+            mock.patch.object(supervisor, "_settle_memory"),
+            mock.patch.object(supervisor, "_launch_child", side_effect=fake_launch),
+        ):
+            proxy_port = _free_port()
+            proxy_server = self._make_proxy_server(proxy_port, supervisor)
+            threading.Thread(
+                target=proxy_server.serve_forever, daemon=True
+            ).start()
+            try:
+                # Request 1: active model, in flight for ~0.6s.
+                first = {}
+
+                def first_request():
+                    status, _, body = _post_with_timeout(
+                        proxy_port,
+                        "/v1/chat/completions",
+                        json.dumps({"model": "owner/repo-a", "messages": []}),
+                        timeout=10,
+                    )
+                    first["status"] = status
+                    first["body"] = body
+                    first["finished"] = time.monotonic()
+
+                t1 = threading.Thread(target=first_request)
+                t1.start()
+                time.sleep(0.15)  # let it reach the engine
+                # Request 2: a different model; triggers the switch.
+                status_b, _, body_b = _post_with_timeout(
+                    proxy_port,
+                    "/v1/chat/completions",
+                    json.dumps({"model": "owner/repo-b", "messages": []}),
+                    timeout=10,
+                )
+                t1.join(10)
+                # The in-flight request must have completed untouched, and
+                # the engine must not have been stopped while it was in
+                # flight.
+                self.assertEqual(first["status"], 200)
+                self.assertEqual(
+                    json.loads(first["body"])["model"], "owner/repo-a"
+                )
+                self.assertEqual(stop_violations, [])
+                self.assertGreaterEqual(
+                    stop_time[0],
+                    first["finished"] - 0.2,  # server-side flush can lead the client read
+                )
+                # And the switching request was held and then served.
+                self.assertEqual(status_b, 200)
+            finally:
+                proxy_server.shutdown()
+                server.shutdown()
+
+    def test_older_request_processed_before_queued_switch(self):
+        """A request that arrived before a model switch is always
+        processed before that switch runs: (1) the first request asks for
+        the initial model A and waits for its load; (2) a second request
+        asks for B while A is still loading and queues the switch; (3) once
+        A is ready, request 1 is served first — the switch to B must not
+        start (and starve request 1) until it has been processed."""
+        backend_a_port, _, server_a, _ = self._start_backend("owner/repo-a")
+        backend_b_port, _, server_b, _ = self._start_backend("owner/repo-b")
+        backend = {"owner/repo-a": backend_a_port, "owner/repo-b": backend_b_port}
+        supervisor = self._make_supervisor(
+            [{"model": "owner/repo-a"}, {"model": "owner/repo-b"}],
+            backend_a_port,
+        )
+        # Rewind to "initial load of A in progress": no engine up yet, the
+        # load (started by request 1) is still running.
+        with supervisor._lock:
+            supervisor._active_model = None
+            supervisor._child_ready = False
+            supervisor._child_port = None
+            supervisor._switching = True
+            supervisor._switch_target = "owner/repo-a"
+
+        def fake_launch(model, *, wait_ready=True):
+            if model == "owner/repo-a":
+                time.sleep(0.4)  # the initial load takes a while
+            with supervisor._lock:
+                supervisor._child_port = backend[model]
+                supervisor._child_ready = True
+                supervisor._active_model = model
+
+        results = {}
+
+        def post(model, key):
+            status, _, body = _post_with_timeout(
+                proxy_port,
+                "/v1/chat/completions",
+                json.dumps({"model": model, "messages": []}),
+                timeout=15,
+            )
+            results[key] = (time.monotonic(), status, body)
+
+        try:
+            with (
+                mock.patch.object(supervisor, "_stop_child"),
+                mock.patch.object(supervisor, "_settle_memory"),
+                mock.patch.object(
+                    supervisor, "_launch_child", side_effect=fake_launch
+                ),
+            ):
+                # The initial load (triggered by request 1) runs in the
+                # background.
+                threading.Thread(
+                    target=supervisor._do_load_first,
+                    args=("owner/repo-a",),
+                    daemon=True,
+                ).start()
+                proxy_port = _free_port()
+                proxy_server = self._make_proxy_server(proxy_port, supervisor)
+                threading.Thread(
+                    target=proxy_server.serve_forever, daemon=True
+                ).start()
+                try:
+                    # Request 1: A — waits for the initial load.
+                    t1 = threading.Thread(target=post, args=("owner/repo-a", "a"))
+                    t1.start()
+                    time.sleep(0.1)  # A is still loading
+                    # Request 2: B — queues the switch behind the load.
+                    t2 = threading.Thread(target=post, args=("owner/repo-b", "b"))
+                    t2.start()
+                    t1.join(15)
+                    t2.join(15)
+                    time_a, status_a, body_a = results["a"]
+                    time_b, status_b, body_b = results["b"]
+                    self.assertEqual(status_a, 200)
+                    self.assertEqual(status_b, 200)
+                    self.assertEqual(
+                        json.loads(body_a)["model"], "owner/repo-a"
+                    )
+                    self.assertEqual(
+                        json.loads(body_b)["model"], "owner/repo-b"
+                    )
+                    # Request 1 (arrived first) was processed before the
+                    # switch to B ran — not starved by it.
+                    self.assertLess(time_a, time_b)
+                finally:
+                    proxy_server.shutdown()
+        finally:
+            server_a.shutdown()
+            server_b.shutdown()
+
+    def test_switch_request_is_queued_behind_crash_restart(self):
+        """A model switch requested while a crash restart is (re)loading
+        the current engine must queue behind the restart, not kill the
+        in-progress load: the restarted model becomes ready first, then the
+        queued switch runs."""
+        backend_port, _, server, _ = self._start_backend("owner/repo-a")
+        supervisor = self._make_supervisor(
+            [{"model": "owner/repo-a"}, {"model": "owner/repo-b"}], backend_port
+        )
+        # Simulate a crashed engine: a dead child process.
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        supervisor._child = dead
+        launched = []
+
+        def fake_launch(model, *, wait_ready=True):
+            launched.append(model)
+            if model == "owner/repo-a":
+                time.sleep(0.3)  # the restart's (re)load takes a moment
+            with supervisor._lock:
+                supervisor._child_port = backend_port
+                supervisor._child_ready = True
+                supervisor._active_model = model
+
+        try:
+            with (
+                mock.patch.object(supervisor, "_settle_memory"),
+                mock.patch.object(
+                    supervisor, "_launch_child", side_effect=fake_launch
+                ),
+            ):
+                threading.Thread(target=supervisor._reap_once, daemon=True).start()
+                for _ in range(200):
+                    if supervisor.switching:  # the restart claimed the lifecycle
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(supervisor.switching)
+                supervisor.switch_to("owner/repo-b")
+                # The switch is queued behind the restart, still loading.
+                self.assertEqual(supervisor.queued_models, ["owner/repo-b"])
+                for _ in range(400):
+                    if (
+                        supervisor.active_model == "owner/repo-b"
+                        and not supervisor.switching
+                    ):
+                        break
+                    time.sleep(0.01)
+                # The restart's load ran to completion before b was loaded.
+                self.assertEqual(launched, ["owner/repo-a", "owner/repo-b"])
+                self.assertEqual(supervisor.queued_models, [])
+        finally:
+            server.shutdown()
+
+    def test_same_model_request_held_until_crash_restart_ready(self):
+        """A request for the active model that arrives while the engine is
+        reloading after a crash is held until the restart is ready again,
+        instead of being forwarded to the dead engine (502) or refused."""
+        backend_port, _, server, _ = self._start_backend("owner/repo-a")
+        supervisor = self._make_supervisor(
+            [{"model": "owner/repo-a"}], backend_port
+        )
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        supervisor._child = dead
+
+        def fake_launch(model, *, wait_ready=True):
+            time.sleep(0.4)
+            with supervisor._lock:
+                supervisor._child_port = backend_port
+                supervisor._child_ready = True
+
+        try:
+            with (
+                mock.patch.object(supervisor, "_settle_memory"),
+                mock.patch.object(
+                    supervisor, "_launch_child", side_effect=fake_launch
+                ),
+            ):
+                threading.Thread(target=supervisor._reap_once, daemon=True).start()
+                for _ in range(200):
+                    if supervisor.switching:
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(supervisor.switching)
+                proxy_port = _free_port()
+                proxy_server = self._make_proxy_server(proxy_port, supervisor)
+                threading.Thread(
+                    target=proxy_server.serve_forever, daemon=True
+                ).start()
+                try:
+                    start = time.monotonic()
+                    status, _, body = _post_with_timeout(
+                        proxy_port,
+                        "/v1/chat/completions",
+                        json.dumps({"model": "owner/repo-a", "messages": []}),
+                        timeout=10,
+                    )
+                    elapsed = time.monotonic() - start
+                    self.assertEqual(status, 200)
+                    self.assertEqual(
+                        json.loads(body)["model"], "owner/repo-a"
+                    )
+                    # Held for the restart, not sent to the dead engine.
+                    self.assertGreaterEqual(elapsed, 0.3)
+                finally:
+                    proxy_server.shutdown()
+        finally:
+            server.shutdown()
+
+    def test_failed_switch_returns_server_error_to_held_request(self):
+        """If loading the requested model fails, the held request gets a
+        503 model_load_failed right away (not after the hold budget), the
+        previous model is restored, and the failed model is not left in
+        the queue."""
+        backend_port, _, server, _ = self._start_backend("owner/repo-a")
+        supervisor = self._make_supervisor(
+            [
+                {"model": "owner/repo-a"},
+                {"model": "owner/repo-b"},
+                {"model": "owner/repo-c"},
+            ],
+            backend_port,
+        )
+        supervisor.hold_timeout = 30.0
+        launched = []
+
+        def fake_launch(model, *, wait_ready=True):
+            launched.append(model)
+            if model == "owner/repo-b":
+                raise RuntimeError("simulated b load failure")
+            with supervisor._lock:
+                supervisor._child_port = backend_port
+                supervisor._child_ready = True
+                supervisor._active_model = model
+
+        try:
+            with (
+                mock.patch.object(supervisor, "_stop_child"),
+                mock.patch.object(supervisor, "_settle_memory"),
+                mock.patch.object(
+                    supervisor, "_launch_child", side_effect=fake_launch
+                ),
+            ):
+                proxy_port = _free_port()
+                proxy_server = self._make_proxy_server(proxy_port, supervisor)
+                threading.Thread(
+                    target=proxy_server.serve_forever, daemon=True
+                ).start()
+                try:
+                    start = time.monotonic()
+                    status, _, body = _post_with_timeout(
+                        proxy_port,
+                        "/v1/chat/completions",
+                        json.dumps({"model": "owner/repo-b", "messages": []}),
+                        timeout=10,
+                    )
+                    elapsed = time.monotonic() - start
+                    self.assertEqual(status, 503)
+                    error = json.loads(body)["error"]
+                    self.assertEqual(error["code"], "model_load_failed")
+                    # Answered as soon as the load failed, well before the
+                    # 30s hold budget.
+                    self.assertLess(elapsed, 5.0)
+                    # The failed model is marked failed and is not queued.
+                    self.assertTrue(supervisor.switch_failed("owner/repo-b"))
+                    self.assertNotIn("owner/repo-b", supervisor.queued_models)
+                    # The previous model was restored and still serves.
+                    self.assertEqual(supervisor.active_model, "owner/repo-a")
+                    status_a, _, body_a = _post(
+                        proxy_port,
+                        "/v1/chat/completions",
+                        json.dumps({"model": "owner/repo-a", "messages": []}),
+                    )
+                    self.assertEqual(status_a, 200)
+                    self.assertEqual(
+                        json.loads(body_a)["model"], "owner/repo-a"
+                    )
+                finally:
+                    proxy_server.shutdown()
+        finally:
+            server.shutdown()
+
     def test_unknown_model_returns_503_immediately(self):
         """A request naming a model that is not in the config gets a quick
         503 model_not_found instead of triggering a failing switch cycle."""
@@ -1372,6 +1735,47 @@ class SupervisorTests(unittest.TestCase):
             self.assertEqual(supervisor.active_model, "c")
             self.assertEqual(supervisor.queued_models, [])
             self.assertEqual(launched, ["b", "c"])
+
+    def test_failed_switch_is_removed_from_queue(self):
+        """A model whose switch failed is removed from the queue: the
+        supervisor restores the previous model and moves on to the next
+        queued model instead of retrying the failing one."""
+        supervisor = serve_multi.Supervisor(
+            [{"model": "a"}, {"model": "b"}, {"model": "c"}],
+            {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
+            "127.0.0.1",
+            0,
+        )
+        supervisor._active_model = "a"
+        supervisor._child_ready = True
+        launched = []
+
+        def fake_launch(model, *, wait_ready=True):
+            launched.append(model)
+            if model == "b":
+                raise RuntimeError("simulated b load failure")
+            with supervisor._lock:
+                supervisor._active_model = model
+                supervisor._child_ready = True
+
+        with (
+            mock.patch.object(supervisor, "_stop_child"),
+            mock.patch.object(supervisor, "_settle_memory"),
+            mock.patch.object(supervisor, "_launch_child", side_effect=fake_launch),
+        ):
+            supervisor._queued_targets = ["b", "c"]
+            supervisor.switch_to("b")
+            for _ in range(400):
+                if supervisor.active_model == "c" and not supervisor.switching:
+                    break
+                time.sleep(0.01)
+            self.assertFalse(supervisor.switching)
+            self.assertEqual(supervisor.active_model, "c")
+            self.assertEqual(supervisor.queued_models, [])
+            # b failed, a was restored, then c loaded — b was not retried.
+            self.assertEqual(launched, ["b", "a", "c"])
+            self.assertTrue(supervisor.switch_failed("b"))
+            self.assertFalse(supervisor.switch_failed("c"))
 
     def test_shutdown_stops_child(self):
         supervisor = serve_multi.Supervisor(
