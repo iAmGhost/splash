@@ -35,6 +35,7 @@ import functools
 import http.client
 import json
 import os
+import shlex
 import signal
 import socket
 import subprocess
@@ -292,16 +293,17 @@ def load_config(path: str | Path) -> list[dict]:
 
         {"models": [
             {"model": "OWNER/REPO", "aliases": ["alias1", "alias2"],
-             "max_context": null},
+             "arguments": ["--max-context", "64000"]},
             ...
         ]}
 
     Every ``model`` entry should be a repo ID that ``model_artifacts`` can
     resolve; aliases are optional and must be valid served-model-name values.
 
-    Per-model keys use the same names as the shared CLI flags (e.g.
-    ``max_context`` for ``--max-context``); a flag given on the command line
-    takes precedence over the per-model value.
+    ``arguments`` (array of '--flag' strings, or one shell-like string)
+    passes extra serve flags to that model's engine only.  When the same
+    flag is also given after '--' on the command line, the command-line
+    value wins for every model.
     """
     try:
         text = Path(path).read_text(encoding="utf-8")
@@ -330,7 +332,9 @@ def load_config(path: str | Path) -> list[dict]:
                 f"{where} must be an object like "
                 '{{"model": "OWNER/REPO", "aliases": [...], "max_context": ...}}'
             )
-        unknown = sorted(set(entry) - {"model", "aliases", "max_context"})
+        unknown = sorted(
+            set(entry) - {"model", "aliases", "max_context", "arguments"}
+        )
         if unknown:
             raise ValueError(f"{where}: unknown keys {unknown}")
         model = entry.get("model")
@@ -355,7 +359,31 @@ def load_config(path: str | Path) -> list[dict]:
         max_context = entry.get("max_context")
         if max_context is not None and not isinstance(max_context, int):
             raise ValueError(f"{where}: 'max_context' must be an integer or null")
-        out.append({"model": model, "aliases": aliases, "max_context": max_context})
+        arguments = entry.get("arguments")
+        if arguments is not None:
+            if isinstance(arguments, str):
+                arguments = shlex.split(arguments)
+            if not isinstance(arguments, list) or not all(
+                isinstance(token, str) for token in arguments
+            ):
+                raise ValueError(
+                    f"{where}: 'arguments' must be an array of '--flag' strings "
+                    "or a single string"
+                )
+            try:
+                _merge_server_arguments(arguments)
+            except ValueError as error:
+                raise ValueError(f"{where} arguments: {error}") from None
+        else:
+            arguments = []
+        out.append(
+            {
+                "model": model,
+                "aliases": aliases,
+                "max_context": max_context,
+                "arguments": arguments,
+            }
+        )
     if not out:
         raise ValueError("config 'models' must contain at least one model")
     return out
@@ -390,6 +418,7 @@ class Supervisor:
     ) -> None:
         self.model_specs = model_specs
         self.shared = shared
+        self.passthrough = list(shared.get("passthrough", []))
         self.host = host
         self.port = port
         raw_hold = shared.get("switch_timeout", HOLD_TIMEOUT)
@@ -784,12 +813,6 @@ class Supervisor:
     def _child_command(self, model: str, spec: dict, port: int) -> list[str]:
         selection = model_artifacts.Selection.of(paths.MODELS, model)
         root, _ = assembly.hold(selection.link, paths.MODELS)
-        # Precedence: shared CLI flag (when given) > per-model config value
-        # > engine default (auto).
-        max_context = self.shared.get("max_context")
-        if max_context is None:
-            max_context = spec["max_context"]
-        max_memory = self.shared.get("max_memory")
         command = [
             str(paths.PYTHON),
             "-u",
@@ -806,30 +829,17 @@ class Supervisor:
             "127.0.0.1",
             "--port",
             str(port),
-            "--max-memory",
-            "auto" if max_memory is None else str(max_memory),
-            "--max-context",
-            "auto" if max_context is None else str(max_context),
         ]
-        kv_format = self.shared.get("kv_format")
-        if kv_format is not None and kv_format != "int8":
-            command.extend(("--kv-format", kv_format))
+        # Precedence, flag by flag: serve flags after '--' > per-model
+        # 'arguments' > the legacy 'max_context' key.
+        model_arguments: list[str] = []
+        if spec.get("max_context") is not None:
+            model_arguments.extend(["--max-context", str(spec["max_context"])])
+        model_arguments.extend(spec.get("arguments") or [])
+        merged = _merge_server_arguments(model_arguments, self.passthrough)
         for name in spec.get("aliases") or ():
             command.append(f"--served-model-name={name}")
-        if self.shared.get("default_reasoning_effort") is not None:
-            command.extend(
-                ["--default-reasoning-effort", self.shared["default_reasoning_effort"]]
-            )
-        if self.shared.get("max_request_size") is not None:
-            command.extend(["--max-request-size", str(self.shared["max_request_size"])])
-        if self.shared.get("max_cache_disk") is not None:
-            command.extend(["--max-cache-disk", str(self.shared["max_cache_disk"])])
-        if self.shared.get("max_image_pixels") is not None:
-            command.extend(["--max-image-pixels", str(self.shared["max_image_pixels"])])
-        if self.shared.get("no_webui"):
-            command.append("--no-webui")
-        for host in self.shared.get("allowed_host") or ():
-            command.extend(["--allowed-host", host])
+        command.extend(_engine_arguments(merged))
         return command
 
     def _child_environment(self) -> dict:
@@ -1843,37 +1853,41 @@ def serve_multi(args) -> int:
 
     Args:
         args: Parsed arguments from ``argparse``.  Must include
-            ``config``, ``host``, ``port``, and any shared flags that the
-            single-model ``serve`` command accepts.
+            ``config`` and the serve-multi flags; ``client_args`` (when
+            present) are the raw 'splash serve' flags given after ``--``
+            and are passed through to every engine instance.
 
     Returns:
         0 on success, 1 on error.
     """
+    passthrough = list(getattr(args, "client_args", None) or [])
     models = load_config(args.config)
     for spec in models:
         _ensure_installed(spec["model"])
+    # Proxy bind settings come from the same serve flags the engines get.
+    host = _flag_value(passthrough, "--host", "127.0.0.1")
+    raw_port = _flag_value(passthrough, "--port", os.environ.get("SPLASH_PORT", "8000"))
+    try:
+        port = int(raw_port)
+    except (TypeError, ValueError):
+        raise ValueError(f"invalid --port {raw_port!r}") from None
+    if not 0 < port < 2**16:
+        raise ValueError(f"--port must be between 1 and 65535, got {raw_port}")
+    api_key = _flag_value(passthrough, "--api-key", os.environ.get("SPLASH_API_KEY"))
+    if api_key is not None:
+        # Fail fast on an unusable key instead of mid-deployment.
+        api_key = validate_api_key(api_key)
     shared: dict = {
         "switch_timeout": args.switch_timeout,
         "switch_settle": args.switch_settle,
         "evict_cache": getattr(args, "evict_cache", True),
-        "default_reasoning_effort": getattr(args, "default_reasoning_effort", None),
-        "kv_format": getattr(args, "kv_format", "int8"),
-        "max_memory": getattr(args, "max_memory", None),
-        "max_context": getattr(args, "max_context", None),
-        "max_request_size": getattr(args, "max_request_size", None),
-        "max_cache_disk": getattr(args, "max_cache_disk", 0),
-        "max_image_pixels": getattr(args, "max_image_pixels", None),
-        "allowed_host": getattr(args, "allowed_host", []),
-        "api_key": getattr(args, "api_key", None),
-        "no_webui": getattr(args, "no_webui", False),
+        "api_key": api_key,
+        "allowed_host": _flag_values(passthrough, "--allowed-host"),
+        "passthrough": _engine_arguments(passthrough),
     }
-    # Filter out None values to match the single-model serve defaults.
     shared = {k: v for k, v in shared.items() if v is not None}
-    if shared.get("api_key") is not None:
-        # Fail fast on an unusable key instead of mid-deployment.
-        shared["api_key"] = validate_api_key(shared["api_key"])
 
-    supervisor = Supervisor(models, shared, args.host, args.port)
+    supervisor = Supervisor(models, shared, host, port)
 
     # Install signal handlers so Ctrl+C / SIGTERM stops the supervisor cleanly.
     previous = {}
@@ -1931,6 +1945,87 @@ def _pick_free_port(host: str) -> int:
         return probe.getsockname()[1]
 
 
+def _flag_value(
+    passthrough: list[str], name: str, default: str | None = None
+) -> str | None:
+    """Return the last value of a flag in a raw 'splash serve' argument list.
+
+    Understands both ``--flag value`` and ``--flag=value`` forms.
+    """
+    value = default
+    for index, arg in enumerate(passthrough):
+        if arg == name:
+            if index + 1 < len(passthrough):
+                value = passthrough[index + 1]
+        elif arg.startswith(name + "="):
+            value = arg.split("=", 1)[1]
+    return value
+
+
+def _flag_values(passthrough: list[str], name: str) -> list[str]:
+    """Return all values of a repeatable flag in a raw serve argument list."""
+    values: list[str] = []
+    for index, arg in enumerate(passthrough):
+        if arg == name:
+            if index + 1 < len(passthrough):
+                values.append(passthrough[index + 1])
+        elif arg.startswith(name + "="):
+            values.append(arg.split("=", 1)[1])
+    return values
+
+
+def _merge_server_arguments(*argument_lists: list[str]) -> list[str]:
+    """Merge raw 'splash serve' argument lists, flag by flag.
+
+    Every list is normalized to its ``--flag`` name, so ``--max-context
+    64000`` and ``--max-context=64000`` collide correctly; when the same
+    flag appears in several lists, the value from the *latest* list wins.
+    A flag whose next token is not another flag is taken as a boolean.
+    Positional tokens are rejected.
+    """
+    merged: dict[str, list[str]] = {}
+    for arguments in argument_lists:
+        index = 0
+        while index < len(arguments):
+            arg = arguments[index]
+            if not arg.startswith("--"):
+                raise ValueError(f"expected '--flag' arguments, found {arg!r}")
+            if "=" in arg:
+                merged[arg.split("=", 1)[0]] = [arg]
+            elif (
+                index + 1 < len(arguments)
+                and not arguments[index + 1].startswith("--")
+            ):
+                merged[arg] = [arg, arguments[index + 1]]
+                index += 1
+            else:
+                merged[arg] = [arg]
+            index += 1
+    return [token for tokens in merged.values() for token in tokens]
+
+
+def _engine_arguments(passthrough: list[str]) -> list[str]:
+    """Serve arguments to hand to the engine child process.
+
+    ``--host``/``--port`` are dropped because the child always binds an
+    internal free port (the proxy owns the user-facing one), and
+    ``--api-key`` travels through SPLASH_API_KEY instead of the command line.
+    """
+    dropped = {"--host", "--port", "--api-key"}
+    out: list[str] = []
+    index = 0
+    while index < len(passthrough):
+        arg = passthrough[index]
+        if arg.split("=", 1)[0] in dropped:
+            if "=" not in arg and index + 1 < len(passthrough):
+                index += 1  # skip the flag's value as well
+            index += 1
+            continue
+        out.append(arg)
+        index += 1
+    return out
+
+
 def _gib(n: int | None) -> str:
     if n is None:
         return "n/a"
@@ -1938,81 +2033,22 @@ def _gib(n: int | None) -> str:
 
 
 def _main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    # Serve flags go after '--' and are passed through to every engine.
+    passthrough: list[str] = []
+    if "--" in argv:
+        boundary = argv.index("--")
+        argv, passthrough = argv[:boundary], argv[boundary + 1 :]
     parser = argparse.ArgumentParser(
         prog="splash serve-multi",
         description="Serve multiple models; restart the engine when a request "
-        "names another.",
+        "names another. 'splash serve' flags are given after '--'.",
     )
     parser.add_argument(
         "--config",
         required=True,
         metavar="FILE",
         help="JSON file listing the models to serve",
-    )
-    parser.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help="HTTP bind address (default: 127.0.0.1; 0.0.0.0 for all IPv4 interfaces)",
-    )
-    parser.add_argument(
-        "--port",
-        type=lambda s: int(s),
-        default=os.environ.get("SPLASH_PORT", "8000"),
-        help="HTTP port (default: SPLASH_PORT or 8000)",
-    )
-    parser.add_argument(
-        "--default-reasoning-effort",
-        choices=("none", "minimal", "low", "medium", "high", "xhigh", "max"),
-        default=None,
-        help="shared: chat/Responses effort when unspecified",
-    )
-    parser.add_argument(
-        "--kv-format",
-        choices=("int8", "bf16"),
-        default="int8",
-        help="shared: target KV cache storage (default: int8)",
-    )
-    parser.add_argument(
-        "--max-memory",
-        default=None,
-        help="shared: Metal budget ceiling, e.g. 28G (default: auto)",
-    )
-    parser.add_argument(
-        "--max-context",
-        type=lambda s: (
-            int(s.rstrip("kK").lstrip()) * (1024 if s.lower().endswith("k") else 1)
-        ),
-        default=None,
-        help="shared context limit, e.g. 100K (takes precedence over the "
-        "per-model 'max_context' config value)",
-    )
-    parser.add_argument(
-        "--allowed-host",
-        action="append",
-        default=[],
-        metavar="HOST",
-        help="shared: additional HTTP Host name to accept (repeatable)",
-    )
-    parser.add_argument(
-        "--max-request-size",
-        default=None,
-        help="shared: maximum HTTP request body size, e.g. 128M",
-    )
-    parser.add_argument(
-        "--max-image-pixels",
-        type=int,
-        default=None,
-        help="shared: maximum resized pixels per image",
-    )
-    parser.add_argument(
-        "--api-key",
-        default=os.environ.get("SPLASH_API_KEY"),
-        help="shared: API key (default: SPLASH_API_KEY)",
-    )
-    parser.add_argument(
-        "--no-webui",
-        action="store_true",
-        help="shared: disable the chat page",
     )
     parser.add_argument(
         "--switch-timeout",
@@ -2048,7 +2084,10 @@ def _main(argv=None):
         help="skip the stale-cache pressure pass; faster switches but higher "
         "risk of 'Q4 buffer below plan' failures",
     )
-    args = parser.parse_args(argv)
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+    args.client_args = passthrough
     return serve_multi(args) or 0
 
 

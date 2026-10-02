@@ -18,12 +18,14 @@ import urllib.request
 try:
     from . import assembly, catalog, clients, paths
     from . import models as model_artifacts
+    from . import serve_multi as _serve_multi
 except ImportError:  # Executed directly by the source or packaged entry point.
     import assembly
     import catalog
     import clients
     import models as model_artifacts
     import paths
+    import serve_multi as _serve_multi
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
@@ -655,6 +657,68 @@ def parse_args(argv=None):
         help="API key (default: SPLASH_API_KEY environment variable)",
     )
     server.add_argument("--no-webui", action="store_true", help="disable the chat page")
+    # Placed right after 'serve' so the help output groups them. Only the
+    # serve-multi-specific flags are parsed here; 'splash serve' flags are
+    # given after '--' and passed through to every engine instance.
+    serve_multi_parser = commands.add_parser(
+        "serve-multi",
+        help="serve multiple models; restart the engine when a request names another",
+        description="Load a JSON config of models, serve them on a single port, and "
+        "switch the native engine transparently when a request targets a "
+        "different model.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  splash serve-multi --config models.json\n"
+            "  splash serve-multi --config models.json -- --port 8001 --no-webui\n\n"
+            "models.json shape:\n"
+            '  {"models": [{"model": "OWNER/REPO", "aliases": ["alias"],'
+            ' "arguments": ["--max-context", "64000"]}, ...]}\n\n'
+            "Per-model 'arguments' pass extra 'splash serve' flags to that "
+            "model's engine. Flags after '--' apply to every engine and take "
+            "precedence over per-model values, flag by flag."
+        ),
+    )
+    serve_multi_parser.add_argument(
+        "--config",
+        required=True,
+        metavar="FILE",
+        help="JSON file listing the models to serve; see epilog for shape",
+    )
+    serve_multi_parser.add_argument(
+        "--switch-timeout",
+        type=float,
+        default=600.0,
+        metavar="SECONDS",
+        help=(
+            "seconds a request waits while its model loads; "
+            "503 is returned after this budget is exhausted (default 600)"
+        ),
+    )
+    serve_multi_parser.add_argument(
+        "--switch-settle",
+        type=float,
+        default=60.0,
+        metavar="SECONDS",
+        help=(
+            "after stopping the current engine, wait up to this many seconds "
+            "for its memory to be reclaimed before launching the next one; "
+            "the wait ends early once the target is reached or memory is "
+            "truly flat (default 60)"
+        ),
+    )
+    serve_multi_parser.add_argument(
+        "--evict-cache",
+        action="store_true",
+        default=True,
+        help="nudge macOS to reclaim the stopped engine's file cache before launching the next model (default: on)",
+    )
+    serve_multi_parser.add_argument(
+        "--no-evict-cache",
+        dest="evict_cache",
+        action="store_false",
+        help="skip the stale-cache pressure pass; faster switches but higher risk of 'Q4 buffer below plan' failures",
+    )
     for name in clients.INSTALL_URLS:
         commands.add_parser(name, help=f"connect {name} to the running server")
     args = parser.parse_args(argv)
@@ -683,7 +747,11 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     try:
-        return serve(args) if args.command == "serve" else coding_client(args)
+        if args.command == "serve":
+            return serve(args)
+        if args.command == "serve-multi":
+            return _serve_multi.serve_multi(args)
+        return coding_client(args)
     except (LauncherError, clients.ClientError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
