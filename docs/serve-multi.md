@@ -6,8 +6,8 @@
 proxy that owns the port you pass; exactly one native engine runs at a
 time. When a request names a model that is not loaded, the proxy waits for
 requests already in flight on the current engine to complete, stops the
-engine, waits for its memory to be reclaimed, loads the requested model,
-and then serves the request — no client-side reconnection or retries
+engine, loads the requested model, and then serves the request — no
+client-side reconnection or retries
 required, and no in-flight request is ever cut short.
 
 ## Usage
@@ -106,8 +106,6 @@ full list):
 | --- | --- | --- |
 | `--config FILE` | required | JSON config listing the models. |
 | `--switch-timeout SECONDS` | `600` | How long a request waits while its model loads before a `503`. `0` answers `503` immediately. |
-| `--switch-settle SECONDS` | `60` | How long to wait for the stopped engine's memory to be reclaimed before launching the next model; the wait ends early once the target is reached or memory is flat. `0` disables. |
-| `--no-evict-cache` | off | Skip the stale-cache reclaim pass. Faster switches, higher risk of `Q4 buffer below plan` failures. |
 
 ### Serve flags after `--`
 
@@ -132,25 +130,6 @@ run behind the proxy:
   ID, and per-engine differences belong in per-model
   [`arguments`](#config-file).
 
-### Memory between models
-
-A stopped engine does not release memory instantly. Its file-backed weight
-pages linger in active cache, and its GPU (wired) buffers stay counted until
-the kernel reclaims them asynchronously; launching the next model into that
-footprint is what causes `Q4 buffer below plan` failures. Before each launch
-the supervisor:
-
-1. measures available and wired memory via `vm_stat`,
-2. briefly allocates and frees a large anonymous buffer to nudge macOS to
-   demote the stale file cache (capped at 12 GiB; disabled by
-   `--no-evict-cache`), and
-3. polls until both pools have room for the next model (estimated from its
-   weight file sizes), the machine is flat for ~15s with enough already
-   available, or the `--switch-settle` budget runs out.
-
-If the budget runs out before enough memory is available, it warns clearly
-and proceeds anyway — the engine's planner reports the failure. On a machine
-busy with other work, switches can take tens of seconds to a few minutes.
 
 ### Endpoints and health
 
