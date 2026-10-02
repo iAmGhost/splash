@@ -24,7 +24,7 @@ def _free_port():
 
 
 def _post(port, path, body, headers=None):
-    return _post_with_timeout(port, path, body, timeout=5)
+    return _post_with_timeout(port, path, body, headers=headers, timeout=5)
 
 
 def _post_with_timeout(port, path, body, headers=None, timeout=5):
@@ -404,6 +404,7 @@ class FakeBackendHandler(BaseHTTPRequestHandler):
             {
                 "model": self.model_id,
                 "body_received": body.decode("utf-8", errors="replace"),
+                "origin": self.headers.get("Origin"),
             }
         ).encode()
         self.send_response(200)
@@ -446,8 +447,8 @@ class ProxyTests(unittest.TestCase):
             "max_request_size": None,
             "max_cache_disk": 0,
             "max_image_pixels": None,
-            "allowed_host": [],
-            "api_key": None,
+            "allowed_host": kwargs.get("allowed_host", []),
+            "api_key": kwargs.get("api_key", None),
             "no_webui": False,
         }
         supervisor = serve_multi.Supervisor(models, shared, "127.0.0.1", 0)
@@ -607,7 +608,8 @@ class ProxyTests(unittest.TestCase):
                 # The upstream spaces its events 0.3s apart; if the proxy
                 # buffered the whole stream, all arrivals would be ~equal.
                 self.assertGreaterEqual(
-                    arrivals[-1] - arrivals[0], 0.6,
+                    arrivals[-1] - arrivals[0],
+                    0.6,
                     f"events arrived in one lump: {arrivals}",
                 )
             finally:
@@ -849,7 +851,8 @@ class ProxyTests(unittest.TestCase):
         supervisor = serve_multi.Supervisor(
             [{"model": "owner/repo-a", "aliases": ["alias-a"]}],
             {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
-            "127.0.0.1", 0,
+            "127.0.0.1",
+            0,
         )
         # Explicitly no model loaded
         supervisor._active_model = None
@@ -897,7 +900,8 @@ class ProxyTests(unittest.TestCase):
         supervisor = serve_multi.Supervisor(
             [{"model": "owner/repo-a", "aliases": ["alias-a"]}],
             {"switch_timeout": 600.0, "switch_settle": 60.0, "evict_cache": False},
-            "127.0.0.1", 0,
+            "127.0.0.1",
+            0,
         )
         supervisor._active_model = None
         supervisor._child_port = None
@@ -935,6 +939,307 @@ class ProxyTests(unittest.TestCase):
                     proxy_server.shutdown()
             finally:
                 server.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# proxy security (API key + Host checks happen before proxying)
+# ---------------------------------------------------------------------------
+
+
+class ProxySecurityTests(ProxyTests):
+    """The proxy must reject bad Host headers and missing/invalid API keys
+    before forwarding, and in particular before a request's model field can
+    trigger a model switch."""
+
+    def _post_raw(self, port, path, body, headers):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("POST", path, body, headers)
+        resp = conn.getresponse()
+        data = resp.read()
+        conn.close()
+        return resp.status, dict(resp.getheaders()), data
+
+    def test_rejects_missing_api_key(self):
+        backend_port, t, server, _ = self._start_backend("owner/repo-a")
+        supervisor = self._make_supervisor(
+            [{"model": "owner/repo-a"}, {"model": "owner/repo-b"}],
+            backend_port,
+            api_key="secret",
+        )
+        switch_triggered = threading.Event()
+        original_switch_to = serve_multi.Supervisor.switch_to
+
+        def patched_switch_to(self, model):
+            switch_triggered.set()
+            return original_switch_to(self, model)
+
+        with mock.patch.object(serve_multi.Supervisor, "switch_to", patched_switch_to):
+            try:
+                proxy_port = _free_port()
+                proxy_server = self._make_proxy_server(proxy_port, supervisor)
+                thread = threading.Thread(
+                    target=proxy_server.serve_forever, daemon=True
+                )
+                thread.start()
+                try:
+                    # A request for a *different* model with no credentials:
+                    # it must be rejected without ever starting a switch.
+                    status, headers, body = self._post_raw(
+                        proxy_port,
+                        "/v1/chat/completions",
+                        json.dumps({"model": "owner/repo-b", "messages": []}),
+                        {"Content-Type": "application/json"},
+                    )
+                    self.assertEqual(status, 401)
+                    self.assertEqual(headers.get("WWW-Authenticate"), "Bearer")
+                    resp = json.loads(body)
+                    self.assertEqual(resp["error"]["code"], "authentication_error")
+                    self.assertFalse(switch_triggered.is_set())
+                finally:
+                    proxy_server.shutdown()
+            finally:
+                server.shutdown()
+
+    def test_rejects_wrong_api_key(self):
+        backend_port, t, server, _ = self._start_backend("owner/repo-a")
+        supervisor = self._make_supervisor(
+            [{"model": "owner/repo-a"}], backend_port, api_key="secret"
+        )
+        try:
+            proxy_port = _free_port()
+            proxy_server = self._make_proxy_server(proxy_port, supervisor)
+            thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                status, _, body = _post(
+                    proxy_port,
+                    "/v1/chat/completions",
+                    json.dumps({"model": "owner/repo-a", "messages": []}),
+                    headers={"Authorization": "Bearer wrong"},
+                )
+                self.assertEqual(status, 401)
+                self.assertEqual(
+                    json.loads(body)["error"]["code"], "authentication_error"
+                )
+            finally:
+                proxy_server.shutdown()
+        finally:
+            server.shutdown()
+
+    def test_accepts_valid_bearer_key(self):
+        backend_port, t, server, _ = self._start_backend("owner/repo-a")
+        supervisor = self._make_supervisor(
+            [{"model": "owner/repo-a"}], backend_port, api_key="secret"
+        )
+        try:
+            proxy_port = _free_port()
+            proxy_server = self._make_proxy_server(proxy_port, supervisor)
+            thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                status, _, body = _post(
+                    proxy_port,
+                    "/v1/chat/completions",
+                    json.dumps({"model": "owner/repo-a", "messages": []}),
+                    headers={"Authorization": "Bearer secret"},
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(json.loads(body)["model"], "owner/repo-a")
+            finally:
+                proxy_server.shutdown()
+        finally:
+            server.shutdown()
+
+    def test_accepts_valid_x_api_key(self):
+        backend_port, t, server, _ = self._start_backend("owner/repo-a")
+        supervisor = self._make_supervisor(
+            [{"model": "owner/repo-a"}], backend_port, api_key="secret"
+        )
+        try:
+            proxy_port = _free_port()
+            proxy_server = self._make_proxy_server(proxy_port, supervisor)
+            thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                status, _, body = self._post_raw(
+                    proxy_port,
+                    "/v1/chat/completions",
+                    json.dumps({"model": "owner/repo-a", "messages": []}),
+                    {"Content-Type": "application/json", "x-api-key": "secret"},
+                )
+                self.assertEqual(status, 200)
+            finally:
+                proxy_server.shutdown()
+        finally:
+            server.shutdown()
+
+    def test_requires_key_outside_public_paths(self):
+        backend_port, t, server, _ = self._start_backend("owner/repo-a")
+        supervisor = self._make_supervisor(
+            [{"model": "owner/repo-a"}], backend_port, api_key="secret"
+        )
+        try:
+            proxy_port = _free_port()
+            proxy_server = self._make_proxy_server(proxy_port, supervisor)
+            thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                # /v1/models and /status are not on the public allowlist.
+                for path in ("/v1/models", "/status"):
+                    with self.subTest(path=path):
+                        status, _, _ = _get(proxy_port, path)
+                        self.assertEqual(status, 401)
+                # Public health endpoints stay open, mirroring server.py.
+                for path in ("/ready", "/health"):
+                    with self.subTest(path=path):
+                        status, _, _ = _get(proxy_port, path)
+                        self.assertNotEqual(status, 401)
+            finally:
+                proxy_server.shutdown()
+        finally:
+            server.shutdown()
+
+    def test_rejects_disallowed_host(self):
+        backend_port, t, server, _ = self._start_backend("owner/repo-a")
+        supervisor = self._make_supervisor(
+            [{"model": "owner/repo-a"}, {"model": "owner/repo-b"}], backend_port
+        )
+        switch_triggered = threading.Event()
+        original_switch_to = serve_multi.Supervisor.switch_to
+
+        def patched_switch_to(self, model):
+            switch_triggered.set()
+            return original_switch_to(self, model)
+
+        with mock.patch.object(serve_multi.Supervisor, "switch_to", patched_switch_to):
+            try:
+                proxy_port = _free_port()
+                proxy_server = self._make_proxy_server(proxy_port, supervisor)
+                thread = threading.Thread(
+                    target=proxy_server.serve_forever, daemon=True
+                )
+                thread.start()
+                try:
+                    conn = http.client.HTTPConnection(
+                        "127.0.0.1", proxy_port, timeout=5
+                    )
+                    body = json.dumps({"model": "owner/repo-b", "messages": []})
+                    conn.request(
+                        "POST",
+                        "/v1/chat/completions",
+                        body,
+                        {
+                            "Content-Type": "application/json",
+                            "Host": "evil.example",
+                        },
+                    )
+                    resp = conn.getresponse()
+                    data = resp.read()
+                    conn.close()
+                    self.assertEqual(resp.status, 403)
+                    self.assertEqual(json.loads(data)["error"]["code"], "forbidden")
+                    self.assertFalse(switch_triggered.is_set())
+                    # The Host check applies to public paths too.
+                    conn = http.client.HTTPConnection(
+                        "127.0.0.1", proxy_port, timeout=5
+                    )
+                    conn.request("GET", "/ready", headers={"Host": "evil.example"})
+                    resp = conn.getresponse()
+                    resp.read()
+                    conn.close()
+                    self.assertEqual(resp.status, 403)
+                finally:
+                    proxy_server.shutdown()
+            finally:
+                server.shutdown()
+
+    def test_accepts_allowed_host_and_loopback(self):
+        backend_port, t, server, _ = self._start_backend("owner/repo-a")
+        supervisor = self._make_supervisor(
+            [{"model": "owner/repo-a"}],
+            backend_port,
+            allowed_host=["open.example"],
+        )
+        self.assertIn("open.example", supervisor.allowed_hosts)
+        try:
+            proxy_port = _free_port()
+            proxy_server = self._make_proxy_server(proxy_port, supervisor)
+            thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=5)
+                conn.request("GET", "/ready", headers={"Host": "open.example"})
+                resp = conn.getresponse()
+                resp.read()
+                conn.close()
+                self.assertEqual(resp.status, 200)
+            finally:
+                proxy_server.shutdown()
+        finally:
+            server.shutdown()
+
+    def test_rewrites_origin_for_upstream(self):
+        """The chat page POSTs with a user-facing Origin (the proxy's
+        port).  The proxy validates that pair, then must present the child
+        with an Origin matching the loopback Host it forces, or the
+        child's own cross-origin check would 403 the request."""
+        backend_port, t, server, _ = self._start_backend("owner/repo-a")
+        supervisor = self._make_supervisor([{"model": "owner/repo-a"}], backend_port)
+        try:
+            proxy_port = _free_port()
+            proxy_server = self._make_proxy_server(proxy_port, supervisor)
+            thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=5)
+                body = json.dumps({"model": "owner/repo-a", "messages": []})
+                conn.request(
+                    "POST",
+                    "/v1/chat/completions",
+                    body,
+                    {
+                        "Content-Type": "application/json",
+                        "Origin": f"http://127.0.0.1:{proxy_port}",
+                    },
+                )
+                resp = conn.getresponse()
+                data = resp.read()
+                conn.close()
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(
+                    json.loads(data)["origin"], f"http://127.0.0.1:{backend_port}"
+                )
+            finally:
+                proxy_server.shutdown()
+        finally:
+            server.shutdown()
+
+    def test_rejects_cross_origin(self):
+        backend_port, t, server, _ = self._start_backend("owner/repo-a")
+        supervisor = self._make_supervisor([{"model": "owner/repo-a"}], backend_port)
+        try:
+            proxy_port = _free_port()
+            proxy_server = self._make_proxy_server(proxy_port, supervisor)
+            thread = threading.Thread(target=proxy_server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", proxy_port, timeout=5)
+                conn.request(
+                    "GET",
+                    "/v1/models",
+                    headers={
+                        "Origin": "http://evil.example",
+                    },
+                )
+                resp = conn.getresponse()
+                data = resp.read()
+                conn.close()
+                self.assertEqual(resp.status, 403)
+                self.assertEqual(json.loads(data)["error"]["code"], "forbidden")
+            finally:
+                proxy_server.shutdown()
+        finally:
+            server.shutdown()
 
 
 # ---------------------------------------------------------------------------

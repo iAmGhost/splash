@@ -10,6 +10,13 @@ until their model is loaded (in arrival order).  Requests that cannot be
 served within the hold budget get a 503 with a ``Retry-After`` header so
 that standard OpenAI/Anthropic SDKs retry them without any application
 changes.
+
+Before anything is proxied, every request is validated the same way the
+single-model server validates it: the Host (and any Origin) header must name
+an allowed host, and an API key (when one is configured) must be presented.
+Rejections happen in ``parse_request``, i.e. before the body is read and
+before a model switch can be triggered, so unauthenticated clients can never
+make the supervisor cycle the engine.
 """
 
 from __future__ import annotations
@@ -40,6 +47,17 @@ else:
 
 ROOT = paths.ROOT
 RUNTIME_DIR = paths.RUNTIME
+
+# The authority/credential checks shared with the single-model server live in
+# the server package next to install/; make the repo root importable.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from server.errors import APIError  # noqa: E402
+from server.http_security import (  # noqa: E402
+    authenticate,
+    validate_api_key,
+    validate_headers,
+)
 
 # Sentinel for detecting unpassed keyword arguments.
 _marker = object()
@@ -90,6 +108,7 @@ def _ensure_installed(model: str) -> None:
         command.insert(-1, "--language-only")
     if subprocess.run(command, cwd=ROOT).returncode:
         raise RuntimeError("model download or verification failed")
+
 
 # ---------------------------------------------------------------------------
 # configuration / constants
@@ -365,6 +384,21 @@ class Supervisor:
             float(raw_settle) if raw_settle is not None else SETTLE_TIMEOUT
         )
         self._evict_cache = bool(shared.get("evict_cache", True))
+        # Pre-proxy security: mirror server.py's own checks so requests are
+        # rejected before they reach the engine (and before a request's model
+        # field can trigger a switch).
+        self.api_key = shared.get("api_key")
+        self.allowed_hosts = {
+            host.lower().rstrip(".")
+            for host in (
+                *shared.get("allowed_host", ()),
+                self.host,
+                "localhost",
+                "127.0.0.1",
+                "::1",
+            )
+            if host not in ("0.0.0.0", "::")
+        }
 
         self._lock = threading.RLock()
         # Serializes whole stop/settle/launch lifecycles so the switch,
@@ -1002,9 +1036,7 @@ class Supervisor:
                 # started (and already relaunched) while we queued.
                 with self._lock:
                     child = self._child
-                    if self._switching or (
-                        child is not None and child.poll() is None
-                    ):
+                    if self._switching or (child is not None and child.poll() is None):
                         return
                 self._settle_memory(_model_memory_need(model))
                 self._launch_child(model, wait_ready=True)
@@ -1143,6 +1175,37 @@ class _ServeMultiHandler(http_server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         # Suppress default access logs to keep stdout clean.
         pass
+
+    def parse_request(self):
+        """Validate Host/Origin and API credentials before any request is
+        proxied or can trigger a model switch.  Mirrors the checks in
+        ``server/server.py``; a rejection sends the same error shape the
+        single-model server would and closes the connection."""
+        if not super().parse_request():
+            return False
+        try:
+            allowed_hosts = self.supervisor.allowed_hosts | {
+                self.connection.getsockname()[0].lower()
+            }
+            validate_headers(self.headers, allowed_hosts)
+            path = self.path.partition("?")[0]
+            public = self.command == "OPTIONS" or (
+                self.command in ("GET", "HEAD")
+                and path in ("/", "/index.html", "/health", "/ready")
+            )
+            if not public:
+                authenticate(self.headers, self.supervisor.api_key)
+        except APIError as error:
+            self.close_connection = True
+            print(
+                f"serve-multi · rejected {error.status} "
+                f"{self.command} {self.path.partition('?')[0]}: {error.message}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._send_auth_error(error)
+            return False
+        return True
 
     # -- routing ------------------------------------------------------------
 
@@ -1318,13 +1381,24 @@ class _ServeMultiHandler(http_server.BaseHTTPRequestHandler):
 
     # -- forwarding ---------------------------------------------------------
 
-    def _forward_headers(self) -> dict:
-        """The client's headers, minus the hop-by-hop headers the proxy owns."""
-        return {
+    def _forward_headers(self, upstream_port: int | None = None) -> dict:
+        """The client's headers, minus the hop-by-hop headers the proxy owns.
+
+        ``Origin`` is rewritten to the upstream's loopback authority: the
+        proxy already validated the client's Host/Origin pair, and upstream
+        it presents ``Host: 127.0.0.1:<port>`` (http.client sets it), so a
+        user-facing Origin would trip the child's own cross-origin check.
+        """
+        headers = {
             key: value
             for key, value in self.headers.items()
             if key.lower() not in _HOP_BY_HOP_HEADERS
         }
+        if upstream_port is not None:
+            for key in headers:
+                if key.lower() == "origin":
+                    headers[key] = f"http://127.0.0.1:{upstream_port}"
+        return headers
 
     def _is_streaming_response(self, resp_headers: dict[str, str]) -> bool:
         """Check if the upstream response is a streaming (SSE) response."""
@@ -1377,7 +1451,7 @@ class _ServeMultiHandler(http_server.BaseHTTPRequestHandler):
             return
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
-            conn.request(method, path, body, self._forward_headers())
+            conn.request(method, path, body, self._forward_headers(port))
             try:
                 self._write_upstream_response(conn.getresponse())
             except (OSError, BrokenPipeError):
@@ -1411,6 +1485,35 @@ class _ServeMultiHandler(http_server.BaseHTTPRequestHandler):
             self.send_header("Retry-After", retry_after)
         self.end_headers()
         self.wfile.write(payload)
+
+    def _send_auth_error(self, error: APIError) -> None:
+        """Send an APIError raised by pre-proxy validation in the same
+        shape the single-model server returns (including the 401
+        ``WWW-Authenticate`` header)."""
+        anthropic = self.path.partition("?")[0].startswith("/v1/messages")
+        error_type = error.protocol_type(anthropic)
+        payload = (
+            {"type": "error", "error": {"type": error_type, "message": error.message}}
+            if anthropic
+            else {
+                "error": {
+                    "message": error.message,
+                    "type": error_type,
+                    "code": error.code,
+                }
+            }
+        )
+        data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        try:
+            self.send_response(error.status)
+            if error.status == 401:
+                self.send_header("WWW-Authenticate", "Bearer")
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _json(self, status: int, body: object) -> None:
         payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
@@ -1465,6 +1568,9 @@ def serve_multi(args) -> int:
     }
     # Filter out None values to match the single-model serve defaults.
     shared = {k: v for k, v in shared.items() if v is not None}
+    if shared.get("api_key") is not None:
+        # Fail fast on an unusable key instead of mid-deployment.
+        shared["api_key"] = validate_api_key(shared["api_key"])
 
     supervisor = Supervisor(models, shared, args.host, args.port)
 
