@@ -1,10 +1,11 @@
 """Compare a candidate build with a baseline build on one installed model.
 
 Run as ``python -m dev.benchmarks.backend_regression --baseline CHECKOUT
---package MODEL_ROOT``. Each checkout's build/ holds splash.metallib and
-engine-tests/backend-benchmark. The native benchmark's decode and partial
-scenarios run in ABBA order (baseline, candidate, candidate, baseline) on this
-machine, which must be otherwise idle:
+--model-root MODEL_ROOT``. Each checkout's build/ holds splash.metallib and
+engine-tests/backend-benchmark, the candidate's engine-tests/weight-digests
+too. The native benchmark's decode and partial scenarios run in ABBA order
+(baseline, candidate, candidate, baseline) on this machine, which must be
+otherwise idle:
 
 - outputs: every width's output_token_hash and accepted/drafted counts and
   every partial request's output tokens are identical in all four rounds. With
@@ -14,12 +15,10 @@ machine, which must be otherwise idle:
 - speed (abba.compare): decode GPU milliseconds per step for B1-B4, the GPU
   time of the 14,096-token cold prefill (partial_4k_cold) and the TTFT of its
   partial hit (partial_4k_hit).
-- prepared bytes: when the builds' preparation identities differ, the
-  baseline prepares into its own cache, <output dir>/baseline-weights, and
-  the candidate keeps the cache its other release steps use, so neither
-  re-prepares between steps; the candidate's cache must hold the bytes of
-  every entry the baseline prepared from the model (prepared.compare). Equal
-  identities share every entry, which then holds by construction.
+- weight bytes: after the rounds both builds load the model's weight images
+  once more and must hold the same images with the same bytes
+  (weights.compare_builds). A baseline of an earlier release prepares into a
+  cache of its own, <output dir>/baseline-weights.
 
 The candidate's own benchmark invariants must hold too, and the baseline must
 be another build: one with the candidate's build_id compares nothing. The
@@ -36,7 +35,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from dev.benchmarks import abba, prepared
+from dev.benchmarks import abba, weights
 from dev.tests import smoke_real as smoke
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -85,7 +84,7 @@ def parse_document(stdout: str, returncode: int) -> dict:
     return document
 
 
-def run_round(tree: Path, package: Path, round_index: int, version: str, args, env):
+def run_round(tree: Path, model_root: Path, round_index: int, version: str, args, env):
     documents = []
     for scenario in invocations(args.combined):
         stem = args.output_dir / (
@@ -94,7 +93,7 @@ def run_round(tree: Path, package: Path, round_index: int, version: str, args, e
         command = [
             str(tree / BENCHMARK),
             str(tree / METALLIB),
-            str(package),
+            str(model_root),
             "--samples",
             str(args.samples),
             "--scenario",
@@ -297,10 +296,10 @@ def summarize(rounds: list[dict], expect_output_change: bool) -> dict:
     }
 
 
-def package_slug(package: Path) -> str:
-    """The name of a package's results under build/release: its path below
-    the models directory, or its own name elsewhere."""
-    path = Path(os.path.abspath(package))
+def results_slug(model_root: Path) -> str:
+    """The name of a model root's results under build/release: its path
+    below the models directory, or its own name elsewhere."""
+    path = Path(os.path.abspath(model_root))
     models = Path(os.path.abspath(smoke.model_artifacts.MODELS))
     try:
         return "--".join(path.relative_to(models).parts)
@@ -317,11 +316,11 @@ def parse_args(argv=None):
         "--candidate", type=Path, default=ROOT, help="candidate checkout (this one)"
     )
     parser.add_argument(
-        "--package", required=True, type=Path, help="installed model root"
+        "--model-root", required=True, type=Path, help="installed model root"
     )
     parser.add_argument("--samples", type=int, default=3)
     parser.add_argument(
-        "--output-dir", type=Path, help="results directory (build/release/<package>)"
+        "--output-dir", type=Path, help="results directory (build/release/<model root>)"
     )
     parser.add_argument(
         "--expect-output-change",
@@ -336,34 +335,31 @@ def parse_args(argv=None):
         for path in (tree / BENCHMARK, tree / METALLIB):
             if not path.is_file():
                 parser.error(f"missing retained benchmark or library: {path}")
-    if prepared.preparation_identity(args.candidate / "build") is None:
-        parser.error(f"the candidate build has no {prepared.IDENTITY_HEADER}")
-    args.kind = smoke.model_artifacts.installation_kind(args.package)
+    if not weights.loads_in_memory(args.candidate / "build"):
+        parser.error(f"the candidate build has no {weights.WEIGHT_DIGESTS}")
+    args.kind = smoke.model_artifacts.installation_kind(args.model_root)
     if args.kind is None:
-        parser.error(f"missing installed model: {args.package}")
+        parser.error(f"missing installed model: {args.model_root}")
     if args.output_dir is None:
-        args.output_dir = ROOT / "build/release" / package_slug(args.package)
+        args.output_dir = ROOT / "build/release" / results_slug(args.model_root)
     return args
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
-    smoke.hold_package(args)
+    smoke.hold_model_root(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     trees = {"baseline": args.baseline.resolve(), "candidate": args.candidate.resolve()}
-    shared = prepared.preparation_identity(
-        trees["baseline"] / "build"
-    ) == prepared.preparation_identity(trees["candidate"] / "build")
     environments = {"baseline": dict(os.environ), "candidate": dict(os.environ)}
-    if not shared:
-        environments["baseline"].update(prepared.baseline_environment(args.output_dir))
+    if not weights.loads_in_memory(trees["baseline"] / "build"):
+        environments["baseline"].update(weights.baseline_environment(args.output_dir))
     args.combined = all(
         supports_scenario_list(tree / BENCHMARK) for tree in trees.values()
     )
     document = {
         "schema_version": 1,
         "timing": "native GPU time and TTFT; ABBA rule of dev/benchmarks/abba.py",
-        "package": str(args.package),
+        "model_root": str(args.model_root),
         "trees": {name: str(tree) for name, tree in trees.items()},
         "samples": args.samples,
         "scenario_invocations": invocations(args.combined),
@@ -375,7 +371,7 @@ def main(argv=None) -> int:
                 version,
                 run_round(
                     trees[version],
-                    args.package,
+                    args.model_root,
                     index,
                     version,
                     args,
@@ -386,21 +382,15 @@ def main(argv=None) -> int:
         ]
         document["rounds"] = rounds
         document["comparison"] = summarize(rounds, args.expect_output_change)
-        document["prepared"] = (
-            {"shared_identity": True, "pass": True}
-            if shared
-            else {
-                "shared_identity": False,
-                **prepared.compare(
-                    prepared.cache_root(environments["baseline"]),
-                    prepared.cache_root(environments["candidate"]),
-                    package=args.package,
-                    required=args.kind == smoke.model_artifacts.ASSEMBLY,
-                ),
-            }
+        document["weights"] = weights.compare_builds(
+            trees["baseline"] / "build",
+            trees["candidate"] / "build",
+            args.model_root,
+            environments["baseline"],
+            args.kind == smoke.model_artifacts.ASSEMBLY,
         )
         document["pass"] = (
-            document["comparison"]["pass"] and document["prepared"]["pass"]
+            document["comparison"]["pass"] and document["weights"]["pass"]
         )
     except Exception as error:
         document["error"] = str(error)
@@ -424,11 +414,10 @@ def report(document: dict) -> None:
             f"{width} acceptance: baseline {rate['baseline']:.4f}, "
             f"candidate {rate['candidate']:.4f}"
         )
-    prepared_bytes = document["prepared"]
+    images = document["weights"]
     print(
-        "prepared bytes: "
-        + ("shared identity" if prepared_bytes.get("shared_identity") else "compared")
-        + (" PASS" if prepared_bytes["pass"] else f" FAIL {prepared_bytes['failures']}")
+        f"weight bytes: {len(images['images'])} images "
+        + ("PASS" if images["pass"] else f"FAIL {images['failures']}")
     )
     for failure in comparison["failures"]:
         print(f"FAIL: {failure}")
