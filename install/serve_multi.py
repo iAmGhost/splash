@@ -46,25 +46,25 @@ from http import server as http_server
 from pathlib import Path
 
 if __package__:
-    from . import models as model_artifacts
     from . import paths
 else:
-    import models as model_artifacts
     import paths
 
-ROOT = paths.ROOT
+# The model ID syntax, credential checks and error payloads shared with the
+# single-model server live in the server package next to install/; make the
+# repo root importable for them, as `splash serve` does.
+if str(paths.ROOT) not in sys.path:
+    sys.path.insert(0, str(paths.ROOT))
 
-# The authority/credential checks shared with the single-model server live in
-# the server package next to install/; make the repo root importable.
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-from server.errors import APIError
+from server import serve_options
+from server.errors import ANTHROPIC_ERRORS, OPENAI_ERRORS, SYSTEMONE_ERRORS, APIError
 from server.http_security import (
     authenticate,
     validate_api_key,
     validate_headers,
 )
 
+ROOT = paths.ROOT
 # Sentinel for detecting unpassed keyword arguments.
 _marker = object()
 
@@ -146,7 +146,7 @@ def load_config(path: str | Path) -> list[dict]:
         if not isinstance(model, str) or not model:
             raise ValueError(f"{where}: 'model' must be a non-empty string")
         try:
-            model_artifacts.parse_model_id(model)
+            serve_options.parse_model_id(model)
         except ValueError:
             raise ValueError(f"{where}: invalid model repo id '{model}'") from None
         aliases = entry.get("aliases")
@@ -251,6 +251,8 @@ class Supervisor:
             )
             if host not in ("0.0.0.0", "::")
         }
+        # As serve_options.parse_allowed_origin returns them.
+        self.allowed_origins = frozenset(shared.get("allowed_origin", ()))
 
         self._lock = threading.RLock()
         # Serializes whole stop/launch lifecycles so the switch,
@@ -1040,7 +1042,9 @@ class _ServeMultiHandler(http_server.BaseHTTPRequestHandler):
             allowed_hosts = self.supervisor.allowed_hosts | {
                 self.connection.getsockname()[0].lower()
             }
-            validate_headers(self.headers, allowed_hosts)
+            validate_headers(
+                self.headers, allowed_hosts, self.supervisor.allowed_origins
+            )
             path = self.path.partition("?")[0]
             public = self.command == "OPTIONS" or (
                 self.command in ("GET", "HEAD")
@@ -1414,27 +1418,26 @@ class _ServeMultiHandler(http_server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _error_dialect(self, path: str):
+        """How the engine route this request targets answers an error, as
+        server.path_errors chooses it; the proxy has no API of its own."""
+        if path.startswith("/v1/messages"):
+            return ANTHROPIC_ERRORS
+        if path == "/v1/systemone":
+            return SYSTEMONE_ERRORS
+        return OPENAI_ERRORS
+
     def _send_auth_error(self, error: APIError) -> None:
-        """Send an APIError raised by pre-proxy validation in the same
-        shape the single-model server returns (including the 401
+        """Answer an APIError rejected before any forwarding with the payload
+        and status the engine route would have used (including the 401
         ``WWW-Authenticate`` header)."""
-        anthropic = self.path.partition("?")[0].startswith("/v1/messages")
-        error_type = error.protocol_type(anthropic)
-        payload = (
-            {"type": "error", "error": {"type": error_type, "message": error.message}}
-            if anthropic
-            else {
-                "error": {
-                    "message": error.message,
-                    "type": error_type,
-                    "code": error.code,
-                }
-            }
-        )
+        status, _code, payload = self._error_dialect(
+            self.path.partition("?")[0]
+        ).answer(error)
         data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         try:
-            self.send_response(error.status)
-            if error.status == 401:
+            self.send_response(status)
+            if status == 401:
                 self.send_header("WWW-Authenticate", "Bearer")
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -1481,7 +1484,9 @@ def serve_multi(args) -> int:
     models = load_config(args.config)
     # Proxy bind settings come from the same serve flags the engines get.
     host = _flag_value(passthrough, "--host", "127.0.0.1")
-    raw_port = _flag_value(passthrough, "--port", os.environ.get("SPLASH_PORT", "8000"))
+    raw_port = _flag_value(
+        passthrough, "--port", os.environ.get("SPLASH_PORT", str(serve_options.DEFAULT_PORT))
+    )
     try:
         port = int(raw_port)
     except (TypeError, ValueError):
@@ -1497,6 +1502,7 @@ def serve_multi(args) -> int:
         "startup_timeout": getattr(args, "startup_timeout", None),
         "api_key": api_key,
         "allowed_host": _flag_values(passthrough, "--allowed-host"),
+        "allowed_origin": _allowed_origins(passthrough),
         "passthrough": _engine_arguments(passthrough),
     }
     shared = {k: v for k, v in shared.items() if v is not None}
@@ -1593,6 +1599,16 @@ def _flag_values(passthrough: list[str], name: str) -> list[str]:
         elif arg.startswith(name + "="):
             values.append(arg.split("=", 1)[1])
     return values
+
+
+def _allowed_origins(passthrough: list[str]) -> list[str]:
+    """Every --allowed-origin value in a raw serve argument list, checked and
+    parsed as the server parses its own (fail fast, before any engine runs)."""
+    values = _flag_values(passthrough, "--allowed-origin")
+    try:
+        return [serve_options.parse_allowed_origin(value) for value in values]
+    except ValueError as error:
+        raise ValueError(f"--allowed-origin: {error}") from None
 
 
 def _merge_server_arguments(*argument_lists: list[str]) -> list[str]:
